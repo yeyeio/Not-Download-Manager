@@ -136,6 +136,7 @@ pub struct IdmApp {
     // Background download engine
     pub engine: DownloadEngineHandle,
     pub next_id: u64,
+    pub db: Arc<crate::db::Database>,
 
     // Headless / screenshot handling
     pub screenshot_path: Option<PathBuf>,
@@ -149,6 +150,15 @@ impl IdmApp {
         let engine = spawn_download_engine();
         let config = AppConfig::default();
         let initial_columns = default_columns();
+
+        let db_path = std::env::var("HYPERDOWNLOAD_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| config.default_download_dir.join("downloads.db"));
+
+        let db = Arc::new(crate::db::Database::open(&db_path).unwrap_or_else(|err| {
+            eprintln!("Warning: Failed to open DB at {:?}: {}, falling back to memory", db_path, err);
+            crate::db::Database::open_in_memory().expect("In-memory DB must open")
+        }));
 
         let mut app = Self {
             downloads: Vec::new(),
@@ -260,6 +270,7 @@ impl IdmApp {
 
             engine,
             next_id: 1,
+            db,
 
             screenshot_path,
             frame_counter: 0,
@@ -272,6 +283,15 @@ impl IdmApp {
     }
 
     fn populate_sample_downloads(&mut self) {
+        let existing = self.db.reconcile_and_load_all().unwrap_or_default();
+        if !existing.is_empty() || self.db.get_download_count().unwrap_or(0) > 0 {
+            let max_id = existing.iter().map(|d| d.id).max().unwrap_or(0);
+            self.downloads = existing;
+            self.next_id = max_id + 1;
+            self.selected_id = self.downloads.first().map(|d| d.id);
+            return;
+        }
+
         // High fidelity sample downloads matching picture-3.png from the original IDM
         let base_time = Local::now();
 
@@ -603,6 +623,15 @@ impl IdmApp {
             let host = item.url.split('/').nth(2).unwrap_or("example.com");
             item.parent_page = Some(format!("https://{}/", host));
             item.referer = Some(format!("https://{}/download", host));
+
+            let settings = DownloadSettings {
+                download_id: item.id,
+                max_connections: item.max_connections,
+                chunk_size: 2 * 1024 * 1024,
+                speed_limit: None,
+                retry_limit: 5,
+            };
+            let _ = self.db.insert_download(item, &settings);
         }
         self.selected_id = Some(15);
         self.next_id = 17;
@@ -618,6 +647,8 @@ impl IdmApp {
                     resume_capable,
                     segments,
                 } => {
+                    let _ = self.db.update_metadata(id, &filename, total_size, None, None);
+                    let _ = self.db.update_status(id, &DownloadStatus::Downloading);
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.filename = filename;
                         item.total_size = total_size;
@@ -643,6 +674,7 @@ impl IdmApp {
                     }
                 }
                 EngineEvent::Finished { id } => {
+                    let _ = self.db.mark_completed(id);
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Completed;
                         item.transfer_rate = 0.0;
@@ -653,6 +685,7 @@ impl IdmApp {
                     }
                 }
                 EngineEvent::Failed { id, error } => {
+                    let _ = self.db.mark_failed(id, &error);
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Error(error);
                         item.transfer_rate = 0.0;
@@ -667,6 +700,7 @@ impl IdmApp {
             if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                 if item.status != DownloadStatus::Completed && item.status != DownloadStatus::Downloading {
                     item.status = DownloadStatus::Connecting;
+                    let _ = self.db.update_status(item.id, &DownloadStatus::Downloading);
                     let _ = self.engine.cmd_sender.send(EngineCommand::StartDownload {
                         id: item.id,
                         url: item.url.clone(),
@@ -683,8 +717,26 @@ impl IdmApp {
             if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                 if item.status == DownloadStatus::Downloading || item.status == DownloadStatus::Connecting {
                     item.status = DownloadStatus::Paused;
+                    item.transfer_rate = 0.0;
+                    let _ = self.db.update_status(item.id, &DownloadStatus::Paused);
                     let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id });
                 }
+            }
+        }
+    }
+
+    pub fn cancel_selected(&mut self) {
+        if let Some(id) = self.selected_id {
+            let mut info = None;
+            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                item.status = DownloadStatus::Canceled;
+                item.transfer_rate = 0.0;
+                info = Some((item.id, item.filename.clone()));
+                let _ = self.db.update_status(item.id, &DownloadStatus::Canceled);
+                let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id });
+            }
+            if let Some((item_id, filename)) = info {
+                self.set_status(format!("Canceled download #{} ({})", item_id, filename));
             }
         }
     }
@@ -692,9 +744,30 @@ impl IdmApp {
     pub fn delete_selected(&mut self) {
         if let Some(id) = self.selected_id {
             let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id });
+            let _ = self.db.delete_download(id);
+
+            // Clean up .partinfo checkpoint file
+            if let Some(item) = self.downloads.iter().find(|d| d.id == id) {
+                let mut partinfo = item.save_path.clone();
+                partinfo.set_file_name(format!("{}.partinfo", item.save_path.file_name().unwrap_or_default().to_string_lossy()));
+                let _ = std::fs::remove_file(partinfo);
+            }
+
             self.downloads.retain(|d| d.id != id);
             self.selected_id = self.downloads.first().map(|d| d.id);
         }
+    }
+
+    pub fn delete_completed(&mut self) {
+        let completed_ids: Vec<u64> = self.downloads.iter()
+            .filter(|d| d.status == DownloadStatus::Completed)
+            .map(|d| d.id)
+            .collect();
+        for id in completed_ids {
+            let _ = self.db.delete_download(id);
+        }
+        self.downloads.retain(|d| d.status != DownloadStatus::Completed);
+        self.selected_id = self.downloads.first().map(|d| d.id);
     }
 
     pub fn set_status(&mut self, msg: String) {
@@ -709,6 +782,7 @@ impl IdmApp {
                 item.status = DownloadStatus::Connecting;
                 item.transfer_rate = 0.0;
                 fname = Some(item.filename.clone());
+                let _ = self.db.update_status(item.id, &DownloadStatus::Downloading);
                 let _ = self.engine.cmd_sender.send(EngineCommand::StartDownload {
                     id: item.id,
                     url: item.url.clone(),
@@ -744,7 +818,7 @@ impl IdmApp {
                 let ext = filename.split('.').last().unwrap_or("");
                 let cat = Category::from_extension(ext);
                 let save_path = self.config.default_download_dir.join(&filename);
-                self.downloads.push(DownloadItem {
+                let item = DownloadItem {
                     id,
                     url: line.to_string(),
                     filename,
@@ -758,7 +832,16 @@ impl IdmApp {
                     max_connections: self.config.default_connections,
                     queue: Some("Main".to_string()),
                     ..Default::default()
-                });
+                };
+                let settings = DownloadSettings {
+                    download_id: id,
+                    max_connections: self.config.default_connections,
+                    chunk_size: 2 * 1024 * 1024,
+                    speed_limit: None,
+                    retry_limit: 5,
+                };
+                let _ = self.db.insert_download(&item, &settings);
+                self.downloads.push(item);
                 added += 1;
             }
         }
@@ -820,7 +903,7 @@ impl IdmApp {
                     let ext = filename.split('.').last().unwrap_or("");
                     let cat = Category::from_extension(ext);
                     let save_path = self.config.default_download_dir.join(&filename);
-                    self.downloads.push(DownloadItem {
+                    let item = DownloadItem {
                         id,
                         url: url.to_string(),
                         filename,
@@ -834,7 +917,16 @@ impl IdmApp {
                         max_connections: self.config.default_connections,
                         queue: Some("Main".to_string()),
                         ..Default::default()
-                    });
+                    };
+                    let settings = DownloadSettings {
+                        download_id: id,
+                        max_connections: self.config.default_connections,
+                        chunk_size: 2 * 1024 * 1024,
+                        speed_limit: None,
+                        retry_limit: 5,
+                    };
+                    let _ = self.db.insert_download(&item, &settings);
+                    self.downloads.push(item);
                     count += 1;
                 }
                 self.set_status(format!("Imported {} downloads from {}", count, path.display()));
@@ -1035,6 +1127,10 @@ impl eframe::App for IdmApp {
                         self.pause_selected();
                         ui.close();
                     }
+                    if ui.add_enabled(has_sel, egui::Button::new("Cancel Download")).clicked() {
+                        self.cancel_selected();
+                        ui.close();
+                    }
                     if ui.add_enabled(has_sel, egui::Button::new("Remove")).clicked() {
                         self.delete_selected();
                         ui.close();
@@ -1065,8 +1161,9 @@ impl eframe::App for IdmApp {
                 ui.menu_button("Downloads", |ui| {
                     if ui.button("Pause All").clicked() {
                         for d in &mut self.downloads {
-                            if d.status == DownloadStatus::Downloading {
+                            if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                                 d.status = DownloadStatus::Paused;
+                                let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
                                 let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
                             }
                         }
@@ -1074,8 +1171,9 @@ impl eframe::App for IdmApp {
                     }
                     if ui.button("Stop All").clicked() {
                         for d in &mut self.downloads {
-                            if d.status == DownloadStatus::Downloading {
+                            if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                                 d.status = DownloadStatus::Paused;
+                                let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
                                 let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
                             }
                         }
@@ -1083,7 +1181,7 @@ impl eframe::App for IdmApp {
                     }
                     ui.separator();
                     if ui.button("Delete All Completed").clicked() {
-                        self.downloads.retain(|d| d.status != DownloadStatus::Completed);
+                        self.delete_completed();
                         ui.close();
                     }
                     ui.separator();
@@ -1310,8 +1408,9 @@ impl eframe::App for IdmApp {
                 );
                 if ui.add(stop_all_btn).clicked() {
                     for d in &mut self.downloads {
-                        if d.status == DownloadStatus::Downloading {
+                        if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                             d.status = DownloadStatus::Paused;
+                            let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
                             let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
                         }
                     }
@@ -1332,7 +1431,7 @@ impl eframe::App for IdmApp {
                     "Delete C...",
                 );
                 if ui.add(del_c_btn).clicked() {
-                    self.downloads.retain(|d| d.status != DownloadStatus::Completed);
+                    self.delete_completed();
                 }
 
                 // Options button
@@ -1740,6 +1839,7 @@ impl eframe::App for IdmApp {
                 // 2. Table Data Rows
                 let mut action_resume = None;
                 let mut action_pause = None;
+                let mut action_cancel = None;
                 let mut action_details = None;
                 let mut action_delete = None;
                 let row_height = 22.0;
@@ -1863,6 +1963,10 @@ impl eframe::App for IdmApp {
                                     action_pause = Some(item_id);
                                     ui.close();
                                 }
+                                if ui.button("⏹ Cancel Download").clicked() {
+                                    action_cancel = Some(item_id);
+                                    ui.close();
+                                }
                                 ui.separator();
                                 if ui.button("🔍 Download Status & Segments...").clicked() {
                                     action_details = Some(item_id);
@@ -1892,6 +1996,10 @@ impl eframe::App for IdmApp {
                 if let Some(id) = action_pause {
                     self.selected_id = Some(id);
                     self.pause_selected();
+                }
+                if let Some(id) = action_cancel {
+                    self.selected_id = Some(id);
+                    self.cancel_selected();
                 }
                 if let Some(id) = action_details {
                     self.progress_modal_id = Some(id);
@@ -1991,6 +2099,15 @@ impl IdmApp {
                 ..Default::default()
                             };
 
+                            let settings = DownloadSettings {
+                                download_id: id,
+                                max_connections: self.config.default_connections,
+                                chunk_size: 2 * 1024 * 1024,
+                                speed_limit: None,
+                                retry_limit: 5,
+                            };
+                            let _ = self.db.insert_download(&item, &settings);
+
                             self.downloads.push(item);
                             self.selected_id = Some(id);
 
@@ -2029,6 +2146,16 @@ impl IdmApp {
                                 queue: Some("Main".to_string()),
                 ..Default::default()
                             };
+
+                            let settings = DownloadSettings {
+                                download_id: id,
+                                max_connections: self.config.default_connections,
+                                chunk_size: 2 * 1024 * 1024,
+                                speed_limit: None,
+                                retry_limit: 5,
+                            };
+                            let _ = self.db.insert_download(&item, &settings);
+
                             self.downloads.push(item);
                             self.show_add_url_modal = false;
                         }
@@ -2940,7 +3067,7 @@ impl IdmApp {
                                         let id = self.next_id;
                                         self.next_id += 1;
                                         let save_p = self.config.default_download_dir.join(&fname);
-                                        self.downloads.push(DownloadItem {
+                                        let item = DownloadItem {
                                             id,
                                             url: u,
                                             filename: fname,
@@ -2954,7 +3081,16 @@ impl IdmApp {
                                             max_connections: self.config.default_connections,
                                             queue: Some("Main".to_string()),
                                             ..Default::default()
-                                        });
+                                        };
+                                        let settings = DownloadSettings {
+                                            download_id: id,
+                                            max_connections: self.config.default_connections,
+                                            chunk_size: 2 * 1024 * 1024,
+                                            speed_limit: None,
+                                            retry_limit: 5,
+                                        };
+                                        let _ = self.db.insert_download(&item, &settings);
+                                        self.downloads.push(item);
                                         count += 1;
                                     }
                                 } else {
@@ -2966,7 +3102,7 @@ impl IdmApp {
                                         let id = self.next_id;
                                         self.next_id += 1;
                                         let save_p = self.config.default_download_dir.join(&fname);
-                                        self.downloads.push(DownloadItem {
+                                        let item = DownloadItem {
                                             id,
                                             url: u,
                                             filename: fname,
@@ -2980,7 +3116,16 @@ impl IdmApp {
                                             max_connections: self.config.default_connections,
                                             queue: Some("Main".to_string()),
                                             ..Default::default()
-                                        });
+                                        };
+                                        let settings = DownloadSettings {
+                                            download_id: id,
+                                            max_connections: self.config.default_connections,
+                                            chunk_size: 2 * 1024 * 1024,
+                                            speed_limit: None,
+                                            retry_limit: 5,
+                                        };
+                                        let _ = self.db.insert_download(&item, &settings);
+                                        self.downloads.push(item);
                                         count += 1;
                                     }
                                 }
@@ -3114,7 +3259,7 @@ impl IdmApp {
                                     let url = format!("{}/{}", self.grabber_start_url.trim_end_matches('/'), f);
                                     let cat = Category::from_extension(f.split('.').last().unwrap_or(""));
                                     let save_p = self.grabber_save_dir.join(f);
-                                    self.downloads.push(DownloadItem {
+                                    let item = DownloadItem {
                                         id,
                                         url,
                                         filename: f.to_string(),
@@ -3128,7 +3273,16 @@ impl IdmApp {
                                         max_connections: self.config.default_connections,
                                         queue: Some("Main".to_string()),
                                         ..Default::default()
-                                    });
+                                    };
+                                    let settings = DownloadSettings {
+                                        download_id: id,
+                                        max_connections: self.config.default_connections,
+                                        chunk_size: 2 * 1024 * 1024,
+                                        speed_limit: None,
+                                        retry_limit: 5,
+                                    };
+                                    let _ = self.db.insert_download(&item, &settings);
+                                    self.downloads.push(item);
                                 }
                                 self.set_status("Site Grabber project created".to_string());
                                 self.show_site_grabber_modal = false;

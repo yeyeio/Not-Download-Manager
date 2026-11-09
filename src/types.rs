@@ -151,6 +151,27 @@ impl Default for DownloadItem {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadSettings {
+    pub download_id: u64,
+    pub max_connections: usize,
+    pub chunk_size: u64,
+    pub speed_limit: Option<u64>,
+    pub retry_limit: u32,
+}
+
+impl Default for DownloadSettings {
+    fn default() -> Self {
+        Self {
+            download_id: 0,
+            max_connections: 8,
+            chunk_size: 2 * 1024 * 1024,
+            speed_limit: None,
+            retry_limit: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnConfig {
     pub id: String,

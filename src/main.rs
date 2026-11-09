@@ -1,12 +1,8 @@
 #![allow(warnings)]
 
-mod engine;
-mod types;
-mod ui;
-
+use app::ui::IdmApp;
 use std::env;
 use std::path::PathBuf;
-use ui::IdmApp;
 
 fn main() -> eframe::Result<()> {
     #[cfg(target_os = "windows")]
