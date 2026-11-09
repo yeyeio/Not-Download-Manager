@@ -2,7 +2,10 @@
 
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Category {
@@ -65,6 +68,44 @@ pub enum HashVerificationStatus {
     VerificationFailed,
 }
 
+impl Default for HashVerificationStatus {
+    fn default() -> Self {
+        HashVerificationStatus::NotConfigured
+    }
+}
+
+impl HashVerificationStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HashVerificationStatus::NotConfigured => "NotConfigured",
+            HashVerificationStatus::Verified => "Verified",
+            HashVerificationStatus::VerificationFailed => "VerificationFailed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "Verified" => HashVerificationStatus::Verified,
+            "VerificationFailed" => HashVerificationStatus::VerificationFailed,
+            _ => HashVerificationStatus::NotConfigured,
+        }
+    }
+
+    pub fn display_text(&self) -> &'static str {
+        match self {
+            HashVerificationStatus::NotConfigured => "Not configured",
+            HashVerificationStatus::Verified => "SHA-256 Verified",
+            HashVerificationStatus::VerificationFailed => "SHA-256 Verification Failed",
+        }
+    }
+}
+
+impl std::fmt::Display for HashVerificationStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
     Queued,
@@ -74,6 +115,7 @@ pub enum DownloadStatus {
     Completed,
     Error(String),
     Canceled,
+    CleanupPending,
 }
 
 impl DownloadStatus {
@@ -86,11 +128,12 @@ impl DownloadStatus {
             DownloadStatus::Completed => "Complete".to_string(),
             DownloadStatus::Error(err) => format!("Error: {}", err),
             DownloadStatus::Canceled => "Canceled".to_string(),
+            DownloadStatus::CleanupPending => "Cleanup Pending".to_string(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SegmentProgress {
     pub segment_index: usize,
     pub start_byte: u64,
@@ -130,6 +173,8 @@ pub struct DownloadItem {
     pub last_try_date: Option<DateTime<Local>>,
     pub parent_page: Option<String>,
     pub referer: Option<String>,
+    pub expected_sha256: Option<String>,
+    pub hash_status: HashVerificationStatus,
 }
 
 impl Default for DownloadItem {
@@ -154,8 +199,145 @@ impl Default for DownloadItem {
             last_try_date: None,
             parent_page: None,
             referer: None,
+            expected_sha256: None,
+            hash_status: HashVerificationStatus::NotConfigured,
         }
     }
+}
+
+// ============================================================================
+// Engine Commands & Events
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub enum EngineCommand {
+    StartDownload {
+        id: u64,
+        url: String,
+        save_path: PathBuf,
+        connections: usize,
+    },
+    PauseDownload {
+        id: u64,
+    },
+    CancelDownload {
+        id: u64,
+    },
+    DeleteDownload {
+        id: u64,
+        cleanup_files: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineEvent {
+    MetadataDiscovered {
+        id: u64,
+        filename: String,
+        total_size: Option<u64>,
+        resume_capable: bool,
+        segments: Vec<SegmentProgress>,
+    },
+    ProgressUpdate {
+        id: u64,
+        downloaded: u64,
+        speed: f64,
+        time_left: Option<u64>,
+        segments: Vec<SegmentProgress>,
+    },
+    Finished {
+        id: u64,
+        hash_status: HashVerificationStatus,
+    },
+    Failed {
+        id: u64,
+        error: String,
+    },
+    Paused {
+        id: u64,
+    },
+    Canceled {
+        id: u64,
+    },
+    Deleted {
+        id: u64,
+        cleanup_success: bool,
+        error: Option<String>,
+    },
+}
+
+// ============================================================================
+// Concurrency Control & Ownership Primitives
+// ============================================================================
+
+#[derive(Clone)]
+pub struct TaskControl {
+    pub instance_id: u64,
+    pub cancel_flag: Arc<AtomicBool>,
+    pub delete_flag: Arc<AtomicBool>,
+    pub pause_flag: Arc<AtomicBool>,
+    pub cleanup_files: Arc<AtomicBool>,
+    pub error_flag: Arc<AtomicBool>,
+    pub terminal_emitted: Arc<AtomicBool>,
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl TaskControl {
+    pub fn new(instance_id: u64) -> Self {
+        Self {
+            instance_id,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            delete_flag: Arc::new(AtomicBool::new(false)),
+            pause_flag: Arc::new(AtomicBool::new(false)),
+            cleanup_files: Arc::new(AtomicBool::new(false)),
+            error_flag: Arc::new(AtomicBool::new(false)),
+            terminal_emitted: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Atomically marks that a terminal event has been emitted.
+    /// Returns true if this call succeeded in setting the flag (first terminal event),
+    /// or false if a terminal event was already emitted for this task instance.
+    pub fn mark_terminal_emitted(&self) -> bool {
+        self.terminal_emitted
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+}
+
+impl Default for TaskControl {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+pub struct ActiveTaskGuard {
+    pub id: u64,
+    pub instance_id: u64,
+    pub active_tasks: Arc<Mutex<HashMap<u64, TaskControl>>>,
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        let mut map = self.active_tasks.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = map.get(&self.id) {
+            if entry.instance_id == self.instance_id {
+                map.remove(&self.id);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Engine Observability Metrics
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct EngineMetrics {
+    pub active_tasks_count: usize,
+    pub known_paths_count: usize,
+    pub active_workers_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,5 +627,126 @@ fn dirs_or_fallback() -> PathBuf {
         PathBuf::from(home).join("Downloads")
     } else {
         PathBuf::from("./Downloads")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_download_status_cleanup_pending() {
+        assert_eq!(DownloadStatus::CleanupPending.text(), "Cleanup Pending");
+        assert_eq!(DownloadStatus::Queued.text(), "Queued");
+        assert_eq!(DownloadStatus::Connecting.text(), "Connecting...");
+        assert_eq!(DownloadStatus::Downloading.text(), "Downloading");
+        assert_eq!(DownloadStatus::Paused.text(), "Paused");
+        assert_eq!(DownloadStatus::Completed.text(), "Complete");
+        assert_eq!(DownloadStatus::Canceled.text(), "Canceled");
+        assert_eq!(DownloadStatus::Error("err".into()).text(), "Error: err");
+    }
+
+    #[test]
+    fn test_hash_verification_status_conversions() {
+        assert_eq!(HashVerificationStatus::default(), HashVerificationStatus::NotConfigured);
+        assert_eq!(HashVerificationStatus::NotConfigured.as_str(), "NotConfigured");
+        assert_eq!(HashVerificationStatus::Verified.as_str(), "Verified");
+        assert_eq!(HashVerificationStatus::VerificationFailed.as_str(), "VerificationFailed");
+
+        assert_eq!(HashVerificationStatus::from_str("NotConfigured"), HashVerificationStatus::NotConfigured);
+        assert_eq!(HashVerificationStatus::from_str("Verified"), HashVerificationStatus::Verified);
+        assert_eq!(HashVerificationStatus::from_str("VerificationFailed"), HashVerificationStatus::VerificationFailed);
+        assert_eq!(HashVerificationStatus::from_str("anything_else"), HashVerificationStatus::NotConfigured);
+
+        assert_eq!(HashVerificationStatus::NotConfigured.display_text(), "Not configured");
+        assert_eq!(HashVerificationStatus::Verified.display_text(), "SHA-256 Verified");
+        assert_eq!(HashVerificationStatus::VerificationFailed.display_text(), "SHA-256 Verification Failed");
+
+        assert_eq!(format!("{}", HashVerificationStatus::Verified), "Verified");
+    }
+
+    #[test]
+    fn test_task_control_terminal_emitted_atomic() {
+        let ctrl = TaskControl::new(42);
+        assert_eq!(ctrl.instance_id, 42);
+        assert!(ctrl.mark_terminal_emitted(), "First call must succeed");
+        assert!(!ctrl.mark_terminal_emitted(), "Subsequent call must return false");
+        assert!(!ctrl.mark_terminal_emitted(), "Third call must return false");
+    }
+
+    #[test]
+    fn test_active_task_guard_instance_id_isolation() {
+        let active_tasks = Arc::new(Mutex::new(HashMap::new()));
+        let task_id = 100u64;
+
+        // Register instance 2 in active_tasks
+        let ctrl2 = TaskControl::new(2);
+        active_tasks.lock().unwrap().insert(task_id, ctrl2);
+
+        // Guard representing old instance 1 drops
+        {
+            let _old_guard = ActiveTaskGuard {
+                id: task_id,
+                instance_id: 1,
+                active_tasks: active_tasks.clone(),
+            };
+        }
+
+        // Active task instance 2 must NOT be evicted by old guard
+        {
+            let map = active_tasks.lock().unwrap();
+            assert!(map.contains_key(&task_id), "Instance 2 must not be evicted by guard 1");
+            assert_eq!(map.get(&task_id).unwrap().instance_id, 2);
+        }
+
+        // Guard matching instance 2 drops
+        {
+            let _current_guard = ActiveTaskGuard {
+                id: task_id,
+                instance_id: 2,
+                active_tasks: active_tasks.clone(),
+            };
+        }
+
+        // Now entry must be cleanly removed
+        assert!(active_tasks.lock().unwrap().is_empty(), "Matching guard drop must evict entry");
+    }
+
+    #[test]
+    fn test_active_task_guard_poisoned_mutex_resilience() {
+        let active_tasks = Arc::new(Mutex::new(HashMap::new()));
+        let task_id = 200u64;
+        let ctrl = TaskControl::new(10);
+        active_tasks.lock().unwrap().insert(task_id, ctrl);
+
+        // Intentionally poison the mutex in another thread
+        let tasks_clone = active_tasks.clone();
+        let _ = std::thread::spawn(move || {
+            let _lock = tasks_clone.lock().unwrap();
+            panic!("Intentional panic to poison mutex");
+        }).join();
+
+        assert!(active_tasks.is_poisoned(), "Mutex must be poisoned");
+
+        // ActiveTaskGuard drop must recover poisoned lock and remove entry without panic
+        {
+            let _guard = ActiveTaskGuard {
+                id: task_id,
+                instance_id: 10,
+                active_tasks: active_tasks.clone(),
+            };
+        }
+
+        // Verify entry was removed
+        let map = active_tasks.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(!map.contains_key(&task_id), "Guard must successfully evict entry even with poisoned mutex");
+    }
+
+    #[test]
+    fn test_engine_metrics_defaults() {
+        let metrics = EngineMetrics::default();
+        assert_eq!(metrics.active_tasks_count, 0);
+        assert_eq!(metrics.known_paths_count, 0);
+        assert_eq!(metrics.active_workers_count, 0);
     }
 }

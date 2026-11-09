@@ -3,7 +3,18 @@ use std::sync::Mutex;
 use chrono::{Local, TimeZone};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::types::{Category, DownloadItem, DownloadSettings, DownloadStatus, SegmentProgress};
+use crate::types::{
+    Category, DownloadItem, DownloadSettings, DownloadStatus, HashVerificationStatus,
+    SegmentProgress,
+};
+
+pub fn hash_status_to_str(status: HashVerificationStatus) -> &'static str {
+    status.as_str()
+}
+
+pub fn hash_status_from_str(s: &str) -> HashVerificationStatus {
+    HashVerificationStatus::from_str(s)
+}
 
 #[derive(Debug)]
 pub enum DbError {
@@ -130,7 +141,8 @@ impl Database {
                     error_message TEXT,
                     etag TEXT,
                     last_modified TEXT,
-                    expected_sha256 TEXT
+                    expected_sha256 TEXT,
+                    hash_status TEXT DEFAULT 'NotConfigured'
                 );
 
                 CREATE TABLE IF NOT EXISTS download_settings (
@@ -148,6 +160,27 @@ impl Database {
             )?;
 
             tx.commit()?;
+        } else {
+            // Backward-compatible column addition for pre-existing version 1 databases
+            let has_hash_status: bool = {
+                let mut stmt = conn.prepare("PRAGMA table_info(downloads)")?;
+                let mut rows = stmt.query([])?;
+                let mut found = false;
+                while let Some(row) = rows.next()? {
+                    let col_name: String = row.get(1)?;
+                    if col_name == "hash_status" {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            };
+            if !has_hash_status {
+                conn.execute(
+                    "ALTER TABLE downloads ADD COLUMN hash_status TEXT DEFAULT 'NotConfigured'",
+                    [],
+                )?;
+            }
         }
 
         Ok(())
@@ -160,7 +193,7 @@ impl Database {
             "SELECT 
                 d.id, d.url, d.filename, d.save_path, d.total_size, d.status,
                 d.created_at, d.updated_at, d.completed_at, d.error_message,
-                d.etag, d.last_modified, d.expected_sha256,
+                d.etag, d.last_modified, d.expected_sha256, d.hash_status,
                 s.max_connections, s.chunk_size, s.speed_limit, s.retry_limit
              FROM downloads d
              LEFT JOIN download_settings s ON d.id = s.download_id
@@ -180,11 +213,17 @@ impl Database {
             let error_message: Option<String> = row.get(9)?;
             let etag: Option<String> = row.get(10)?;
             let _last_modified: Option<String> = row.get(11)?;
-            let _expected_sha256: Option<String> = row.get(12)?;
-            let max_connections: Option<i64> = row.get(13)?;
-            let _chunk_size: Option<i64> = row.get(14)?;
-            let _speed_limit: Option<i64> = row.get(15)?;
-            let _retry_limit: Option<i64> = row.get(16)?;
+            let expected_sha256: Option<String> = row.get(12)?;
+            let hash_status_str: Option<String> = row.get(13)?;
+            let max_connections: Option<i64> = row.get(14)?;
+            let _chunk_size: Option<i64> = row.get(15)?;
+            let _speed_limit: Option<i64> = row.get(16)?;
+            let _retry_limit: Option<i64> = row.get(17)?;
+
+            let hash_status = hash_status_str
+                .as_deref()
+                .map(hash_status_from_str)
+                .unwrap_or(HashVerificationStatus::NotConfigured);
 
             Ok((
                 id as u64,
@@ -197,6 +236,8 @@ impl Database {
                 error_message,
                 max_connections.unwrap_or(8) as usize,
                 etag,
+                expected_sha256,
+                hash_status,
             ))
         })?;
 
@@ -204,7 +245,7 @@ impl Database {
         let mut updates_to_apply: Vec<(u64, String, Option<String>)> = Vec::new();
 
         for row_res in rows {
-            let (id, url, filename, save_path, total_size, status_str, created_at, error_msg, max_conns, etag) = row_res?;
+            let (id, url, filename, save_path, total_size, status_str, created_at, error_msg, max_conns, etag, expected_sha256, hash_status) = row_res?;
 
             let mut partinfo_path = save_path.clone();
             partinfo_path.set_file_name(format!("{}.partinfo", save_path.file_name().unwrap_or_default().to_string_lossy()));
@@ -274,6 +315,9 @@ impl Database {
                         (DownloadStatus::Canceled, 0, Vec::new())
                     }
                 }
+                "CleanupPending" => {
+                    (DownloadStatus::CleanupPending, 0, Vec::new())
+                }
                 _ => (DownloadStatus::Queued, 0, Vec::new()),
             };
 
@@ -301,6 +345,8 @@ impl Database {
                 last_try_date: None,
                 parent_page: None,
                 referer: None,
+                expected_sha256,
+                hash_status,
             });
         }
 
@@ -334,18 +380,20 @@ impl Database {
             DownloadStatus::Completed => "Completed",
             DownloadStatus::Error(_) => "Error",
             DownloadStatus::Canceled => "Canceled",
+            DownloadStatus::CleanupPending => "CleanupPending",
         };
         let error_msg = match &item.status {
             DownloadStatus::Error(e) => Some(e.as_str()),
             _ => None,
         };
+        let hash_status_str = hash_status_to_str(item.hash_status);
 
         let id = if item.id > 0 {
             tx.execute(
                 "INSERT INTO downloads (
                     id, url, filename, save_path, total_size, status,
-                    created_at, updated_at, error_message
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    created_at, updated_at, error_message, expected_sha256, hash_status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     item.id as i64,
                     item.url,
@@ -356,6 +404,8 @@ impl Database {
                     now,
                     now,
                     error_msg,
+                    item.expected_sha256.as_deref(),
+                    hash_status_str,
                 ],
             )?;
             item.id
@@ -363,8 +413,8 @@ impl Database {
             tx.execute(
                 "INSERT INTO downloads (
                     url, filename, save_path, total_size, status,
-                    created_at, updated_at, error_message
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    created_at, updated_at, error_message, expected_sha256, hash_status
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     item.url,
                     item.filename,
@@ -374,6 +424,8 @@ impl Database {
                     now,
                     now,
                     error_msg,
+                    item.expected_sha256.as_deref(),
+                    hash_status_str,
                 ],
             )?;
             tx.last_insert_rowid() as u64
@@ -468,6 +520,7 @@ impl Database {
             DownloadStatus::Completed => ("Completed", None),
             DownloadStatus::Error(e) => ("Error", Some(e.as_str())),
             DownloadStatus::Canceled => ("Canceled", None),
+            DownloadStatus::CleanupPending => ("CleanupPending", None),
         };
 
         let rows = conn.execute(
@@ -483,18 +536,109 @@ impl Database {
     }
 
     pub fn mark_completed(&self, id: u64) -> Result<(), DbError> {
+        self.mark_completed_with_hash(id, None)
+    }
+
+    pub fn mark_completed_with_hash(
+        &self,
+        id: u64,
+        hash_status: Option<&HashVerificationStatus>,
+    ) -> Result<(), DbError> {
         let conn = self.conn.lock().unwrap();
         let now = Local::now().timestamp();
+        let rows = if let Some(hs) = hash_status {
+            let hs_str = hash_status_to_str(*hs);
+            conn.execute(
+                "UPDATE downloads 
+                 SET status = 'Completed', completed_at = ?1, updated_at = ?2, error_message = NULL, hash_status = ?3 
+                 WHERE id = ?4",
+                params![now, now, hs_str, id as i64],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE downloads 
+                 SET status = 'Completed', completed_at = ?1, updated_at = ?2, error_message = NULL 
+                 WHERE id = ?3",
+                params![now, now, id as i64],
+            )?
+        };
+
+        if rows == 0 {
+            return Err(DbError::NotFound(id));
+        }
+        Ok(())
+    }
+
+    pub fn update_hash_status(
+        &self,
+        id: u64,
+        status: &HashVerificationStatus,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Local::now().timestamp();
+        let status_str = hash_status_to_str(*status);
         let rows = conn.execute(
             "UPDATE downloads 
-             SET status = 'Completed', completed_at = ?1, updated_at = ?2, error_message = NULL 
+             SET hash_status = ?1, updated_at = ?2 
              WHERE id = ?3",
-            params![now, now, id as i64],
+            params![status_str, now, id as i64],
         )?;
         if rows == 0 {
             return Err(DbError::NotFound(id));
         }
         Ok(())
+    }
+
+    pub fn update_expected_sha256(
+        &self,
+        id: u64,
+        expected_sha256: Option<&str>,
+    ) -> Result<(), DbError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Local::now().timestamp();
+        let rows = conn.execute(
+            "UPDATE downloads 
+             SET expected_sha256 = ?1, updated_at = ?2 
+             WHERE id = ?3",
+            params![expected_sha256, now, id as i64],
+        )?;
+        if rows == 0 {
+            return Err(DbError::NotFound(id));
+        }
+        Ok(())
+    }
+
+    pub fn get_hash_status(&self, id: u64) -> Result<(Option<String>, HashVerificationStatus), DbError> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT expected_sha256, hash_status FROM downloads WHERE id = ?1",
+            params![id as i64],
+            |row| {
+                let exp: Option<String> = row.get(0)?;
+                let status_str: Option<String> = row.get(1)?;
+                let hs = status_str
+                    .as_deref()
+                    .map(hash_status_from_str)
+                    .unwrap_or(HashVerificationStatus::NotConfigured);
+                Ok((exp, hs))
+            },
+        )
+        .optional()?
+        .ok_or(DbError::NotFound(id))
+    }
+
+    pub fn get_save_path(&self, id: u64) -> Result<PathBuf, DbError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        conn.query_row(
+            "SELECT save_path FROM downloads WHERE id = ?1",
+            rusqlite::params![id as i64],
+            |row| {
+                let s: String = row.get(0)?;
+                Ok(PathBuf::from(s))
+            },
+        )
+        .optional()?
+        .ok_or(DbError::NotFound(id))
     }
 
     pub fn mark_failed(&self, id: u64, error_msg: &str) -> Result<(), DbError> {
@@ -561,6 +705,29 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |r| r.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Returns the maximum download ID currently in the database, or 0 if empty.
+    /// Fast O(1) B-tree lookup without disk metadata or checkpoint validation.
+    pub fn get_max_download_id(&self) -> Result<u64, DbError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let max_id: Option<i64> = conn.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM downloads",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(max_id.unwrap_or(0) as u64)
+    }
+
+    /// Checks if a download record exists in the database.
+    pub fn download_exists(&self, id: u64) -> Result<bool, DbError> {
+        let conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM downloads WHERE id = ?1)",
+            params![id as i64],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     pub fn get_settings(&self, download_id: u64) -> Result<DownloadSettings, DbError> {
@@ -673,90 +840,202 @@ fn read_partinfo_committed_bytes(
     (0, Vec::new())
 }
 
-/// Computes SHA-256 hash for arbitrary data (pure-Rust standard FIPS 180-4 implementation).
-pub fn compute_sha256(data: &[u8]) -> String {
-    let k: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
+const SHA256_K: [u32; 64] = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+];
 
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
+const SHA256_INITIAL_H: [u32; 8] = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+];
 
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0x00);
+fn transform_sha256_block(h: &mut [u32; 8], block: &[u8; 64]) {
+    let mut w = [0u32; 64];
+    for (i, w_val) in w.iter_mut().take(16).enumerate() {
+        *w_val = u32::from_be_bytes([
+            block[i * 4],
+            block[i * 4 + 1],
+            block[i * 4 + 2],
+            block[i * 4 + 3],
+        ]);
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 64];
-        for (i, w_val) in w.iter_mut().take(16).enumerate() {
-            *w_val = u32::from_be_bytes([chunk[i * 4], chunk[i * 4 + 1], chunk[i * 4 + 2], chunk[i * 4 + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut h_val = h[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h_val.wrapping_add(s1).wrapping_add(ch).wrapping_add(k[i]).wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h_val = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(h_val);
+    for i in 16..64 {
+        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
     }
 
-    format!(
-        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
-        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
-    )
+    let mut a = h[0];
+    let mut b = h[1];
+    let mut c = h[2];
+    let mut d = h[3];
+    let mut e = h[4];
+    let mut f = h[5];
+    let mut g = h[6];
+    let mut h_val = h[7];
+
+    for i in 0..64 {
+        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ ((!e) & g);
+        let temp1 = h_val
+            .wrapping_add(s1)
+            .wrapping_add(ch)
+            .wrapping_add(SHA256_K[i])
+            .wrapping_add(w[i]);
+        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let temp2 = s0.wrapping_add(maj);
+
+        h_val = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(temp1);
+        d = c;
+        c = b;
+        b = a;
+        a = temp1.wrapping_add(temp2);
+    }
+
+    h[0] = h[0].wrapping_add(a);
+    h[1] = h[1].wrapping_add(b);
+    h[2] = h[2].wrapping_add(c);
+    h[3] = h[3].wrapping_add(d);
+    h[4] = h[4].wrapping_add(e);
+    h[5] = h[5].wrapping_add(f);
+    h[6] = h[6].wrapping_add(g);
+    h[7] = h[7].wrapping_add(h_val);
 }
 
-/// Verifies whether the file at `path` matches the `expected_hex` SHA-256 digest.
+/// Pure-Rust streaming SHA-256 Hasher complying with FIPS 180-4.
+///
+/// Maintains fixed 64-byte internal buffering and consumes streaming chunks with
+/// bounded stack memory (< 5 MB peak incremental memory on any file size).
+#[derive(Clone, Debug)]
+pub struct Sha256Hasher {
+    h: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Default for Sha256Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256Hasher {
+    pub fn new() -> Self {
+        Self {
+            h: SHA256_INITIAL_H,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+
+    /// Appends incoming byte slice to the streaming hasher.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+
+        if self.buf_len > 0 {
+            let to_fill = 64 - self.buf_len;
+            if data.len() < to_fill {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            } else {
+                self.buf[self.buf_len..64].copy_from_slice(&data[..to_fill]);
+                transform_sha256_block(&mut self.h, &self.buf);
+                self.buf_len = 0;
+                data = &data[to_fill..];
+            }
+        }
+
+        let chunks = data.chunks_exact(64);
+        let remainder = chunks.remainder();
+        for chunk in chunks {
+            let mut block = [0u8; 64];
+            block.copy_from_slice(chunk);
+            transform_sha256_block(&mut self.h, &block);
+        }
+
+        if !remainder.is_empty() {
+            self.buf[..remainder.len()].copy_from_slice(remainder);
+            self.buf_len = remainder.len();
+        }
+    }
+
+    /// Finalizes the hash calculation and returns the 32-byte digest according to FIPS 180-4 padding.
+    pub fn finalize(mut self) -> [u8; 32] {
+        let bit_len = self.total_len.wrapping_mul(8);
+
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+
+        if self.buf_len > 56 {
+            self.buf[self.buf_len..64].fill(0);
+            transform_sha256_block(&mut self.h, &self.buf);
+            self.buf[..56].fill(0);
+        } else {
+            self.buf[self.buf_len..56].fill(0);
+        }
+
+        self.buf[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        transform_sha256_block(&mut self.h, &self.buf);
+
+        let mut digest = [0u8; 32];
+        for (i, &val) in self.h.iter().enumerate() {
+            digest[i * 4..(i + 1) * 4].copy_from_slice(&val.to_be_bytes());
+        }
+        digest
+    }
+
+    /// Finalizes the hash calculation and formats the digest as a 64-character lowercase hexadecimal string.
+    pub fn finalize_hex(self) -> String {
+        let digest = self.finalize();
+        let mut hex = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(&mut hex, "{:02x}", byte);
+        }
+        hex
+    }
+}
+
+/// Convenience function to compute SHA-256 for a byte slice in memory.
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256Hasher::new();
+    hasher.update(data);
+    hasher.finalize_hex()
+}
+
+/// Verifies whether the file at `path` matches the `expected_hex` SHA-256 digest
+/// using a streaming 64 KiB reusable buffer without whole-file heap allocation (< 5 MB peak RAM).
 pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<bool, std::io::Error> {
-    let bytes = std::fs::read(path)?;
-    let computed = compute_sha256(&bytes);
+    use std::fs::File;
+    use std::io::Read;
+
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256Hasher::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    let computed = hasher.finalize_hex();
     Ok(computed.eq_ignore_ascii_case(expected_hex.trim()))
 }
 
@@ -964,5 +1243,213 @@ mod tests {
         let deleted = db.delete_completed_downloads().unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(db.get_download_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sha256_one_million_a() {
+        let mut hasher = Sha256Hasher::new();
+        let chunk = [b'a'; 1000];
+        for _ in 0..1000 {
+            hasher.update(&chunk);
+        }
+        assert_eq!(
+            hasher.finalize_hex(),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn test_sha256_multi_buffer_chunking_continuity() {
+        let message = b"The quick brown fox jumps over the lazy dog";
+        let expected = compute_sha256(message);
+
+        // Feed data byte by byte
+        let mut hasher1 = Sha256Hasher::new();
+        for &b in message {
+            hasher1.update(&[b]);
+        }
+        assert_eq!(hasher1.finalize_hex(), expected);
+
+        // Feed data in 5-byte chunks
+        let mut hasher5 = Sha256Hasher::new();
+        for chunk in message.chunks(5) {
+            hasher5.update(chunk);
+        }
+        assert_eq!(hasher5.finalize_hex(), expected);
+    }
+
+    #[test]
+    fn test_verify_file_sha256_streaming_and_case_insensitive() {
+        let temp_dir = TempDir::new("verify_sha256");
+        let file_path = temp_dir.path().join("test_verify.bin");
+
+        // Write 130 KiB file (spans multiple 64 KiB buffers)
+        let data: Vec<u8> = (0..133120).map(|i| (i % 256) as u8).collect();
+        std::fs::write(&file_path, &data).unwrap();
+
+        let expected_lower = compute_sha256(&data);
+        let expected_upper = expected_lower.to_uppercase();
+        let expected_padded = format!("  {} \n", expected_lower);
+
+        assert!(verify_file_sha256(&file_path, &expected_lower).unwrap());
+        assert!(verify_file_sha256(&file_path, &expected_upper).unwrap());
+        assert!(verify_file_sha256(&file_path, &expected_padded).unwrap());
+
+        let wrong_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert!(!verify_file_sha256(&file_path, wrong_hash).unwrap());
+
+        let nonexistent = temp_dir.path().join("does_not_exist.bin");
+        assert!(verify_file_sha256(&nonexistent, &expected_lower).is_err());
+    }
+
+    #[test]
+    fn test_db_hash_status_persistence_and_update() {
+        let db = Database::open_in_memory().unwrap();
+        let expected = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let item = DownloadItem {
+            id: 0,
+            url: "https://example.com/file_with_hash.zip".into(),
+            filename: "file_with_hash.zip".into(),
+            save_path: PathBuf::from("downloads/file_with_hash.zip"),
+            total_size: Some(1024),
+            status: DownloadStatus::Queued,
+            expected_sha256: Some(expected.to_string()),
+            hash_status: HashVerificationStatus::NotConfigured,
+            ..Default::default()
+        };
+        let settings = DownloadSettings::default();
+        let id = db.insert_download(&item, &settings).unwrap();
+
+        let (exp, status) = db.get_hash_status(id).unwrap();
+        assert_eq!(exp.as_deref(), Some(expected));
+        assert_eq!(status, HashVerificationStatus::NotConfigured);
+
+        // Update to Verified
+        db.update_hash_status(id, &HashVerificationStatus::Verified).unwrap();
+        let (_, status_v) = db.get_hash_status(id).unwrap();
+        assert_eq!(status_v, HashVerificationStatus::Verified);
+
+        // Mark completed with hash status VerificationFailed
+        db.mark_completed_with_hash(id, Some(&HashVerificationStatus::VerificationFailed)).unwrap();
+        let (_, status_f) = db.get_hash_status(id).unwrap();
+        assert_eq!(status_f, HashVerificationStatus::VerificationFailed);
+    }
+
+    #[test]
+    fn test_db_migration_from_v1_without_hash_status() {
+        let temp_dir = TempDir::new("v1_migrate");
+        let db_path = temp_dir.path().join("legacy_v1.db");
+
+        // Create legacy DB lacking hash_status column
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE downloads (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    save_path TEXT NOT NULL,
+                    total_size INTEGER,
+                    status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    completed_at INTEGER,
+                    error_message TEXT,
+                    etag TEXT,
+                    last_modified TEXT,
+                    expected_sha256 TEXT
+                );
+                CREATE TABLE download_settings (
+                    download_id INTEGER PRIMARY KEY,
+                    max_connections INTEGER NOT NULL DEFAULT 8,
+                    chunk_size INTEGER NOT NULL DEFAULT 2097152,
+                    speed_limit INTEGER,
+                    retry_limit INTEGER NOT NULL DEFAULT 5,
+                    FOREIGN KEY (download_id) REFERENCES downloads(id) ON DELETE CASCADE
+                );
+                PRAGMA user_version = 1;",
+            ).unwrap();
+
+            conn.execute(
+                "INSERT INTO downloads (id, url, filename, save_path, total_size, status, created_at, updated_at)
+                 VALUES (1, 'https://example.com/legacy.bin', 'legacy.bin', 'legacy.bin', 100, 'Paused', 1000, 1000)",
+                [],
+            ).unwrap();
+        }
+
+        // Open with our Database: should detect missing hash_status, alter table, keep user_version = 1
+        let db = Database::open(&db_path).unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(version, 1, "Schema version must remain 1");
+        }
+
+        let items = db.reconcile_and_load_all().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].hash_status, HashVerificationStatus::NotConfigured);
+    }
+
+    #[test]
+    fn test_db_cleanup_pending_persistence() {
+        let db = Database::open_in_memory().unwrap();
+        let item = DownloadItem {
+            id: 0,
+            url: "https://example.com/cleanup.bin".into(),
+            filename: "cleanup.bin".into(),
+            save_path: PathBuf::from("downloads/cleanup.bin"),
+            status: DownloadStatus::CleanupPending,
+            ..Default::default()
+        };
+        let id = db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let loaded = db.reconcile_and_load_all().unwrap();
+        assert_eq!(loaded[0].id, id);
+        assert_eq!(loaded[0].status, DownloadStatus::CleanupPending);
+
+        // Update status to Paused then back to CleanupPending
+        db.update_status(id, &DownloadStatus::Paused).unwrap();
+        let loaded2 = db.reconcile_and_load_all().unwrap();
+        assert_eq!(loaded2[0].status, DownloadStatus::Paused);
+
+        db.update_status(id, &DownloadStatus::CleanupPending).unwrap();
+        let loaded3 = db.reconcile_and_load_all().unwrap();
+        assert_eq!(loaded3[0].status, DownloadStatus::CleanupPending);
+    }
+
+    #[test]
+    fn test_db_get_max_download_id_and_exists() {
+        let db = Database::open_in_memory().unwrap();
+        assert_eq!(db.get_max_download_id().unwrap(), 0);
+        assert!(!db.download_exists(1).unwrap());
+
+        let item1 = DownloadItem {
+            id: 42,
+            url: "https://example.com/item42.bin".into(),
+            filename: "item42.bin".into(),
+            status: DownloadStatus::Paused,
+            ..Default::default()
+        };
+        db.insert_download(&item1, &DownloadSettings::default()).unwrap();
+
+        assert_eq!(db.get_max_download_id().unwrap(), 42);
+        assert!(db.download_exists(42).unwrap());
+        assert!(!db.download_exists(43).unwrap());
+
+        let item2 = DownloadItem {
+            id: 100,
+            url: "https://example.com/item100.bin".into(),
+            filename: "item100.bin".into(),
+            status: DownloadStatus::Paused,
+            ..Default::default()
+        };
+        db.insert_download(&item2, &DownloadSettings::default()).unwrap();
+
+        assert_eq!(db.get_max_download_id().unwrap(), 100);
+        assert!(db.download_exists(100).unwrap());
+
+        db.delete_download(100).unwrap();
+        assert!(!db.download_exists(100).unwrap());
+        assert_eq!(db.get_max_download_id().unwrap(), 42);
     }
 }

@@ -139,6 +139,11 @@ pub struct IdmApp {
     pub db: Arc<crate::db::Database>,
     pub is_reconciling: bool,
     pub reconcile_rx: Option<std::sync::mpsc::Receiver<Result<Vec<DownloadItem>, String>>>,
+    pub reconcile_handle: Option<std::thread::JoinHandle<()>>,
+    pub deleted_task_ids: std::collections::HashSet<u64>,
+    pub deleting_task_ids: std::collections::HashSet<u64>,
+    pub task_versions: std::collections::HashMap<u64, u64>,
+    pub cleanup_errors: std::collections::HashMap<u64, String>,
 
     // Headless / screenshot handling
     pub screenshot_path: Option<PathBuf>,
@@ -148,6 +153,17 @@ pub struct IdmApp {
 }
 
 impl IdmApp {
+    #[inline]
+    pub fn mark_task_mutated(&mut self, id: u64) {
+        *self.task_versions.entry(id).or_insert(0) += 1;
+    }
+
+    #[inline]
+    pub fn mark_task_deleted(&mut self, id: u64) {
+        self.deleted_task_ids.insert(id);
+        self.deleting_task_ids.remove(&id);
+        self.task_versions.remove(&id);
+    }
     pub fn new(screenshot_path: Option<PathBuf>) -> Self {
         let engine = spawn_download_engine();
         let config = AppConfig::default();
@@ -162,9 +178,11 @@ impl IdmApp {
             crate::db::Database::open_in_memory().expect("In-memory DB must open")
         }));
 
+        let initial_max_id = db.get_max_download_id().unwrap_or(0);
+
         let (rec_tx, rec_rx) = std::sync::mpsc::channel();
         let db_for_rec = db.clone();
-        std::thread::spawn(move || {
+        let reconcile_handle = std::thread::spawn(move || {
             let res = db_for_rec
                 .reconcile_and_load_all()
                 .map_err(|e| format!("Reconciliation failed: {}", e));
@@ -280,10 +298,15 @@ impl IdmApp {
             status_message: None,
 
             engine,
-            next_id: 1,
+            next_id: initial_max_id + 1,
             db: db.clone(),
             is_reconciling: true,
             reconcile_rx: Some(rec_rx),
+            reconcile_handle: Some(reconcile_handle),
+            deleted_task_ids: std::collections::HashSet::new(),
+            deleting_task_ids: std::collections::HashSet::new(),
+            task_versions: std::collections::HashMap::new(),
+            cleanup_errors: std::collections::HashMap::new(),
 
             screenshot_path,
             frame_counter: 0,
@@ -299,20 +322,98 @@ impl IdmApp {
             if let Ok(res) = rx.try_recv() {
                 self.is_reconciling = false;
                 self.reconcile_rx = None;
+                if let Some(handle) = self.reconcile_handle.take() {
+                    let _ = handle.join();
+                }
                 match res {
                     Ok(items) => {
-                        if !items.is_empty() || self.db.get_download_count().unwrap_or(0) > 0 {
-                            let max_id = items.iter().map(|d| d.id).max().unwrap_or(0);
-                            self.downloads = items;
-                            self.next_id = max_id + 1;
+                        let had_reconciled_items = !items.is_empty();
+                        let existing_ids: std::collections::HashSet<u64> =
+                            self.downloads.iter().map(|d| d.id).collect();
+
+                        for rec_item in items {
+                            // 1. Tombstone check: discard any item whose ID is in deleted_task_ids or deleting_task_ids
+                            if self.deleted_task_ids.contains(&rec_item.id)
+                                || self.deleting_task_ids.contains(&rec_item.id)
+                            {
+                                continue;
+                            }
+
+                            // 2. Conflict check: existing in-memory download
+                            if let Some(existing) = self.downloads.iter_mut().find(|d| d.id == rec_item.id) {
+                                let is_mutated = self.task_versions.get(&rec_item.id).copied().unwrap_or(0) > 0
+                                    || existing.status == DownloadStatus::Downloading
+                                    || existing.status == DownloadStatus::Connecting
+                                    || existing.status == DownloadStatus::CleanupPending
+                                    || existing.status == DownloadStatus::Canceled
+                                    || existing.status == DownloadStatus::Paused;
+
+                                if is_mutated {
+                                    // Preserve in-memory mutated state, backfill missing metadata
+                                    if existing.total_size.is_none() && rec_item.total_size.is_some() {
+                                        existing.total_size = rec_item.total_size;
+                                    }
+                                    if existing.description.is_empty() && !rec_item.description.is_empty() {
+                                        existing.description = rec_item.description;
+                                    }
+                                    if existing.expected_sha256.is_none() && rec_item.expected_sha256.is_some() {
+                                        existing.expected_sha256 = rec_item.expected_sha256;
+                                    }
+                                    if existing.hash_status == HashVerificationStatus::NotConfigured
+                                        && rec_item.hash_status != HashVerificationStatus::NotConfigured
+                                    {
+                                        existing.hash_status = rec_item.hash_status;
+                                    }
+                                } else {
+                                    // Unmodified: update to reconciled disk state
+                                    *existing = rec_item;
+                                }
+                            } else if !existing_ids.contains(&rec_item.id) {
+                                // 3. Disjoint record not yet in self.downloads:
+                                // Verify it has not been deleted from SQLite in the meantime
+                                let exists_in_db = self.db.download_exists(rec_item.id).unwrap_or(true);
+                                if exists_in_db {
+                                    self.downloads.push(rec_item);
+                                } else {
+                                    self.deleted_task_ids.insert(rec_item.id);
+                                }
+                            }
+                        }
+
+                        // 4. Stable sort by ID
+                        self.downloads.sort_by_key(|d| d.id);
+
+                        // 5. Monotonically advance self.next_id
+                        let max_id = self.downloads.iter().map(|d| d.id).max().unwrap_or(0);
+                        self.next_id = std::cmp::max(self.next_id, max_id + 1);
+
+                        // 6. Retain valid selected_id
+                        if self.selected_id.is_none()
+                            || !self.downloads.iter().any(|d| Some(d.id) == self.selected_id)
+                        {
                             self.selected_id = self.downloads.first().map(|d| d.id);
-                        } else {
+                        }
+
+                        // 7. Suppress sample download injection unless this is a genuinely clean first run:
+                        if self.downloads.is_empty()
+                            && self.deleted_task_ids.is_empty()
+                            && self.deleting_task_ids.is_empty()
+                            && !had_reconciled_items
+                            && self.db.get_download_count().ok() == Some(0)
+                        {
                             self.populate_default_sample_downloads();
                         }
                     }
                     Err(e) => {
                         eprintln!("Startup reconciliation error: {}", e);
                         self.set_status(format!("Reconciliation warning: {}", e));
+                        if self.downloads.is_empty()
+                            && self.deleted_task_ids.is_empty()
+                            && self.deleting_task_ids.is_empty()
+                            && self.db.get_download_count().ok() == Some(0)
+                        {
+                            self.populate_default_sample_downloads();
+                        }
                     }
                 }
             }
@@ -320,6 +421,9 @@ impl IdmApp {
     }
 
     fn populate_default_sample_downloads(&mut self) {
+        if !self.downloads.is_empty() {
+            return;
+        }
         // High fidelity sample downloads matching picture-3.png from the original IDM
         let base_time = Local::now();
 
@@ -664,7 +768,7 @@ impl IdmApp {
             }
         }
         self.selected_id = Some(15);
-        self.next_id = 17;
+        self.next_id = std::cmp::max(self.next_id, 17);
     }
 
     pub fn poll_engine_events(&mut self) {
@@ -691,6 +795,7 @@ impl IdmApp {
                         item.segments = segments;
                         item.status = DownloadStatus::Downloading;
                     }
+                    self.mark_task_mutated(id);
                 }
                 EngineEvent::ProgressUpdate {
                     id,
@@ -700,35 +805,46 @@ impl IdmApp {
                     segments,
                 } => {
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                        item.downloaded_bytes = downloaded;
-                        item.transfer_rate = speed;
-                        item.time_left_secs = time_left;
-                        if !segments.is_empty() {
-                            item.segments = segments;
+                        // Guard against trailing progress events arriving after terminal/paused events
+                        if item.status == DownloadStatus::Downloading || item.status == DownloadStatus::Connecting {
+                            item.downloaded_bytes = downloaded;
+                            item.transfer_rate = speed;
+                            item.time_left_secs = time_left;
+                            if !segments.is_empty() {
+                                item.segments = segments;
+                            }
+                            self.mark_task_mutated(id);
                         }
                     }
                 }
-                EngineEvent::Finished { id } => {
-                    if let Err(e) = self.db.mark_completed(id) {
-                        eprintln!("Database error marking #{}: completed: {}", id, e);
+                EngineEvent::Finished { id, hash_status } => {
+                    // FINDING-4.2-10: Persist verification status with mark_completed_with_hash
+                    if let Err(e) = self.db.mark_completed_with_hash(id, Some(&hash_status)) {
+                        eprintln!("Database error marking #{}: completed with hash: {}", id, e);
                     }
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Completed;
+                        item.hash_status = hash_status;
                         item.transfer_rate = 0.0;
                         item.time_left_secs = None;
                         if let Some(total) = item.total_size {
                             item.downloaded_bytes = total;
                         }
                     }
+                    self.mark_task_mutated(id);
+                    self.set_status(format!("Download #{} completed ({})", id, hash_status.display_text()));
                 }
                 EngineEvent::Failed { id, error } => {
                     if let Err(e) = self.db.mark_failed(id, &error) {
                         eprintln!("Database error marking #{}: failed: {}", id, e);
                     }
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                        item.status = DownloadStatus::Error(error);
+                        item.status = DownloadStatus::Error(error.clone());
                         item.transfer_rate = 0.0;
+                        item.time_left_secs = None;
                     }
+                    self.mark_task_mutated(id);
+                    self.set_status(format!("Download #{} failed: {}", id, error));
                 }
                 EngineEvent::Paused { id } => {
                     if let Err(e) = self.db.update_status(id, &DownloadStatus::Paused) {
@@ -737,7 +853,10 @@ impl IdmApp {
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Paused;
                         item.transfer_rate = 0.0;
+                        item.time_left_secs = None;
                     }
+                    self.mark_task_mutated(id);
+                    self.set_status(format!("Download #{} paused", id));
                 }
                 EngineEvent::Canceled { id } => {
                     if let Err(e) = self.db.update_status(id, &DownloadStatus::Canceled) {
@@ -746,25 +865,49 @@ impl IdmApp {
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Canceled;
                         item.transfer_rate = 0.0;
+                        item.time_left_secs = None;
                     }
+                    self.mark_task_mutated(id);
+                    self.set_status(format!("Download #{} canceled", id));
                 }
                 EngineEvent::Deleted {
                     id,
                     cleanup_success,
                     error,
                 } => {
-                    // Safe Delete lifecycle: SQLite record is deleted ONLY after engine confirms file cleanup
-                    if let Err(e) = self.db.delete_download(id) {
-                        eprintln!("Database error deleting download #{}: {}", id, e);
-                    }
-                    self.downloads.retain(|d| d.id != id);
-                    if self.selected_id == Some(id) {
-                        self.selected_id = self.downloads.first().map(|d| d.id);
-                    }
+                    self.deleting_task_ids.remove(&id);
                     if cleanup_success {
+                        if let Err(e) = self.db.delete_download(id) {
+                            eprintln!("Database error deleting download #{}: {}", id, e);
+                        }
+                        self.downloads.retain(|d| d.id != id);
+                        self.deleted_task_ids.insert(id);
+                        self.task_versions.remove(&id);
+                        self.cleanup_errors.remove(&id);
+                        if self.selected_id == Some(id) {
+                            self.selected_id = self.downloads.first().map(|d| d.id);
+                        }
                         self.set_status(format!("Download #{} deleted successfully", id));
-                    } else if let Some(err) = error {
-                        self.set_status(format!("Download #{} deleted with notice: {}", id, err));
+                    } else {
+                        // FINDING-4.2-08: Filesystem unlinking failed (locked file / OS error):
+                        // MUST NOT delete DB record or remove from UI!
+                        // Task transitions to DownloadStatus::CleanupPending.
+                        let err_text = error.unwrap_or_else(|| "Destination file locked or inaccessible".into());
+                        if let Err(e) = self.db.update_status(id, &DownloadStatus::CleanupPending) {
+                            eprintln!("Database error updating status to CleanupPending for #{}: {}", id, e);
+                        }
+                        self.cleanup_errors.insert(id, err_text.clone());
+                        if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                            item.status = DownloadStatus::CleanupPending;
+                            item.transfer_rate = 0.0;
+                            item.time_left_secs = None;
+                            item.description = format!("Cleanup failed: {}", err_text);
+                        }
+                        self.mark_task_mutated(id);
+                        self.set_status(format!(
+                            "Cleanup failed for download #{}: {}. Click 'Retry Cleanup' to retry.",
+                            id, err_text
+                        ));
                     }
                 }
             }
@@ -773,19 +916,31 @@ impl IdmApp {
 
     pub fn resume_selected(&mut self) {
         if let Some(id) = self.selected_id {
-            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                if item.status != DownloadStatus::Completed && item.status != DownloadStatus::Downloading {
-                    item.status = DownloadStatus::Connecting;
-                    if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Downloading) {
-                        eprintln!("Database error updating status for #{}: {}", item.id, e);
+            if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+                if self.downloads[idx].status == DownloadStatus::CleanupPending {
+                    self.set_status(format!("Cannot resume #{}: file cleanup is pending", id));
+                    return;
+                }
+                if self.downloads[idx].status != DownloadStatus::Completed
+                    && self.downloads[idx].status != DownloadStatus::Downloading
+                {
+                    self.downloads[idx].status = DownloadStatus::Connecting;
+                    let url = self.downloads[idx].url.clone();
+                    let save_path = self.downloads[idx].save_path.clone();
+                    let connections = self.downloads[idx].max_connections;
+
+                    self.mark_task_mutated(id);
+
+                    if let Err(e) = self.db.update_status(id, &DownloadStatus::Downloading) {
+                        eprintln!("Database error updating status for #{}: {}", id, e);
                     }
                     if let Err(e) = self.engine.cmd_sender.send(EngineCommand::StartDownload {
-                        id: item.id,
-                        url: item.url.clone(),
-                        save_path: item.save_path.clone(),
-                        connections: item.max_connections,
+                        id,
+                        url,
+                        save_path,
+                        connections,
                     }) {
-                        eprintln!("Engine error sending StartDownload for #{}: {}", item.id, e);
+                        eprintln!("Engine error sending StartDownload for #{}: {}", id, e);
                     }
                 }
             }
@@ -794,15 +949,24 @@ impl IdmApp {
 
     pub fn pause_selected(&mut self) {
         if let Some(id) = self.selected_id {
-            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                if item.status == DownloadStatus::Downloading || item.status == DownloadStatus::Connecting {
-                    item.status = DownloadStatus::Paused;
-                    item.transfer_rate = 0.0;
-                    if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Paused) {
-                        eprintln!("Database error updating status for #{}: {}", item.id, e);
+            if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+                if self.downloads[idx].status == DownloadStatus::CleanupPending {
+                    return;
+                }
+                if self.downloads[idx].status == DownloadStatus::Downloading
+                    || self.downloads[idx].status == DownloadStatus::Connecting
+                {
+                    self.downloads[idx].status = DownloadStatus::Paused;
+                    self.downloads[idx].transfer_rate = 0.0;
+                    self.downloads[idx].time_left_secs = None;
+
+                    self.mark_task_mutated(id);
+
+                    if let Err(e) = self.db.update_status(id, &DownloadStatus::Paused) {
+                        eprintln!("Database error updating status for #{}: {}", id, e);
                     }
-                    if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id }) {
-                        eprintln!("Engine error sending PauseDownload for #{}: {}", item.id, e);
+                    if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id }) {
+                        eprintln!("Engine error sending PauseDownload for #{}: {}", id, e);
                     }
                 }
             }
@@ -812,39 +976,86 @@ impl IdmApp {
     pub fn cancel_selected(&mut self) {
         if let Some(id) = self.selected_id {
             let mut info = None;
-            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                item.status = DownloadStatus::Canceled;
-                item.transfer_rate = 0.0;
-                info = Some((item.id, item.filename.clone()));
-                if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Canceled) {
-                    eprintln!("Database error updating status for #{}: {}", item.id, e);
+            if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+                if self.downloads[idx].status == DownloadStatus::CleanupPending {
+                    return;
                 }
-                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::CancelDownload { id: item.id }) {
-                    eprintln!("Engine error sending CancelDownload for #{}: {}", item.id, e);
+                self.downloads[idx].status = DownloadStatus::Canceled;
+                self.downloads[idx].transfer_rate = 0.0;
+                self.downloads[idx].time_left_secs = None;
+                info = Some(self.downloads[idx].filename.clone());
+
+                self.mark_task_mutated(id);
+
+                if let Err(e) = self.db.update_status(id, &DownloadStatus::Canceled) {
+                    eprintln!("Database error updating status for #{}: {}", id, e);
+                }
+                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::CancelDownload { id }) {
+                    eprintln!("Engine error sending CancelDownload for #{}: {}", id, e);
                 }
             }
-            if let Some((item_id, filename)) = info {
-                self.set_status(format!("Canceled download #{} ({})", item_id, filename));
+            if let Some(filename) = info {
+                self.set_status(format!("Canceled download #{} ({})", id, filename));
             }
         }
     }
 
     pub fn delete_selected(&mut self) {
         if let Some(id) = self.selected_id {
+            self.deleting_task_ids.insert(id);
+            self.mark_task_mutated(id);
             // Signal engine to stop leases, await workers & writer actor, suppress checkpoints, and clean up files
             if let Err(e) = self.engine.cmd_sender.send(EngineCommand::DeleteDownload { id, cleanup_files: true }) {
                 eprintln!("Engine error sending DeleteDownload for #{}: {}", id, e);
             }
             // Mark visually as Deleting while engine confirms file teardown
-            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                item.status = DownloadStatus::Error("Deleting...".into());
-                item.transfer_rate = 0.0;
+            if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+                self.downloads[idx].status = DownloadStatus::Error("Deleting...".into());
+                self.downloads[idx].transfer_rate = 0.0;
+                self.downloads[idx].time_left_secs = None;
             }
             self.set_status(format!("Deleting download #{}...", id));
         }
     }
 
+    pub fn retry_cleanup_selected(&mut self) {
+        if let Some(id) = self.selected_id {
+            self.retry_cleanup(id);
+        }
+    }
+
+    pub fn retry_cleanup(&mut self, id: u64) {
+        if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+            if self.downloads[idx].status == DownloadStatus::CleanupPending {
+                self.deleting_task_ids.insert(id);
+                self.mark_task_mutated(id);
+                self.downloads[idx].status = DownloadStatus::Error("Cleaning up...".into());
+                self.downloads[idx].transfer_rate = 0.0;
+                self.downloads[idx].time_left_secs = None;
+                self.set_status(format!("Retrying file cleanup for download #{}...", id));
+                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::DeleteDownload {
+                    id,
+                    cleanup_files: true,
+                }) {
+                    eprintln!("Engine error sending DeleteDownload retry for #{}: {}", id, e);
+                    self.set_status(format!("Engine error retrying cleanup for #{}: {}", id, e));
+                    if let Some(idx2) = self.downloads.iter().position(|d| d.id == id) {
+                        self.downloads[idx2].status = DownloadStatus::CleanupPending;
+                    }
+                    self.deleting_task_ids.remove(&id);
+                }
+            }
+        }
+    }
+
     pub fn delete_completed(&mut self) {
+        for d in &self.downloads {
+            if d.status == DownloadStatus::Completed {
+                self.deleted_task_ids.insert(d.id);
+                self.task_versions.remove(&d.id);
+            }
+        }
+
         // Optimize delete_completed() using single atomic SQL query
         match self.db.delete_completed_downloads() {
             Ok(count) => {
@@ -865,26 +1076,34 @@ impl IdmApp {
 
     pub fn redownload_selected(&mut self) {
         if let Some(id) = self.selected_id {
-            let mut fname = None;
-            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
-                item.downloaded_bytes = 0;
-                item.status = DownloadStatus::Connecting;
-                item.transfer_rate = 0.0;
-                fname = Some(item.filename.clone());
-                if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Downloading) {
-                    eprintln!("Database error updating status for #{}: {}", item.id, e);
+            if let Some(idx) = self.downloads.iter().position(|d| d.id == id) {
+                if self.downloads[idx].status == DownloadStatus::CleanupPending {
+                    self.set_status(format!("Cannot redownload #{}: file cleanup is pending", id));
+                    return;
+                }
+                self.downloads[idx].downloaded_bytes = 0;
+                self.downloads[idx].status = DownloadStatus::Connecting;
+                self.downloads[idx].transfer_rate = 0.0;
+                self.downloads[idx].time_left_secs = None;
+                let fname = self.downloads[idx].filename.clone();
+                let url = self.downloads[idx].url.clone();
+                let save_path = self.downloads[idx].save_path.clone();
+                let connections = self.downloads[idx].max_connections;
+
+                self.mark_task_mutated(id);
+
+                if let Err(e) = self.db.update_status(id, &DownloadStatus::Downloading) {
+                    eprintln!("Database error updating status for #{}: {}", id, e);
                 }
                 if let Err(e) = self.engine.cmd_sender.send(EngineCommand::StartDownload {
-                    id: item.id,
-                    url: item.url.clone(),
-                    save_path: item.save_path.clone(),
-                    connections: item.max_connections,
+                    id,
+                    url,
+                    save_path,
+                    connections,
                 }) {
-                    eprintln!("Engine error sending StartDownload for #{}: {}", item.id, e);
+                    eprintln!("Engine error sending StartDownload for #{}: {}", id, e);
                 }
-            }
-            if let Some(name) = fname {
-                self.set_status(format!("Redownloading {}", name));
+                self.set_status(format!("Redownloading {}", fname));
             }
         }
     }
@@ -936,6 +1155,7 @@ impl IdmApp {
                 if let Err(e) = self.db.insert_download(&item, &settings) {
                     eprintln!("Database error inserting download from clipboard: {}", e);
                 }
+                self.mark_task_mutated(item.id);
                 self.downloads.push(item);
                 added += 1;
             }
@@ -1023,6 +1243,7 @@ impl IdmApp {
                     if let Err(e) = self.db.insert_download(&item, &settings) {
                         eprintln!("Database error inserting imported download: {}", e);
                     }
+                    self.mark_task_mutated(item.id);
                     self.downloads.push(item);
                     count += 1;
                 }
@@ -1111,6 +1332,14 @@ impl IdmApp {
             }
         }
         self.set_status(format!("Queue '{}': stopped {} download(s)", queue_name, stopped));
+    }
+}
+
+impl Drop for IdmApp {
+    fn drop(&mut self) {
+        if let Some(handle) = self.reconcile_handle.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -1535,6 +1764,23 @@ impl eframe::App for IdmApp {
                 );
                 if ui.add_enabled(self.selected_id.is_some(), delete_btn).clicked() {
                     self.delete_selected();
+                }
+
+                // Explicit "Retry Cleanup" warning button when selected download is in CleanupPending
+                let is_cleanup_pending = self.selected_id
+                    .and_then(|id| self.downloads.iter().find(|d| d.id == id))
+                    .map(|d| d.status == DownloadStatus::CleanupPending)
+                    .unwrap_or(false);
+
+                if is_cleanup_pending {
+                    let retry_btn = egui::Button::new(
+                        RichText::new("⚠️ Retry Cleanup")
+                            .color(Color32::WHITE)
+                            .strong()
+                    ).fill(Color32::from_rgb(230, 110, 0));
+                    if ui.add(retry_btn).clicked() {
+                        self.retry_cleanup_selected();
+                    }
                 }
 
                 // Delete Completed button
@@ -1965,6 +2211,7 @@ impl eframe::App for IdmApp {
                 let mut action_cancel = None;
                 let mut action_details = None;
                 let mut action_delete = None;
+                let mut action_retry_cleanup = None;
                 let row_height = 22.0;
 
                 for (row_num, &idx) in filtered_downloads.iter().enumerate() {
@@ -1989,6 +2236,7 @@ impl eframe::App for IdmApp {
                         DownloadStatus::Queued => ("Queued".to_string(), Color32::LIGHT_GRAY),
                         DownloadStatus::Error(e) => (format!("Error: {}", e), Color32::from_rgb(255, 75, 75)),
                         DownloadStatus::Canceled => ("Canceled".to_string(), Color32::GRAY),
+                        DownloadStatus::CleanupPending => ("Cleanup Pending".to_string(), Color32::from_rgb(255, 140, 0)),
                     };
 
                     let text_color = if is_selected { Color32::WHITE } else { Color32::from_rgb(220, 220, 220) };
@@ -2037,7 +2285,11 @@ impl eframe::App for IdmApp {
                                 }
                                     "status" => {
                                         let color = if is_selected { Color32::WHITE } else { status_color };
-                                        cell_ui.add(egui::Label::new(RichText::new(&status_text).color(color)).truncate());
+                                        let lbl = cell_ui.add(egui::Label::new(RichText::new(&status_text).color(color)).truncate());
+                                        if status == DownloadStatus::CleanupPending {
+                                            let err_msg = self.cleanup_errors.get(&item_id).cloned().unwrap_or_else(|| "File locked or inaccessible".to_string());
+                                            lbl.on_hover_text(format!("File cleanup failed: {}\nClick 'Retry Cleanup' once the file is unlocked.", err_msg));
+                                        }
                                     }
                                     "time_left" => {
                                         cell_ui.add(egui::Label::new(RichText::new(&formatted_time_left).color(text_color)).truncate());
@@ -2078,19 +2330,33 @@ impl eframe::App for IdmApp {
                             }
 
                             cell_resp.context_menu(|ui| {
-                                if ui.button("▶ Resume Download").clicked() {
-                                    action_resume = Some(item_id);
-                                    ui.close();
+                                let is_cleanup = self.downloads[idx].status == DownloadStatus::CleanupPending;
+                                if is_cleanup {
+                                    let retry_btn = egui::Button::new(
+                                        RichText::new("🔄 Retry Cleanup")
+                                            .color(Color32::from_rgb(255, 140, 0))
+                                            .strong()
+                                    );
+                                    if ui.add(retry_btn).clicked() {
+                                        action_retry_cleanup = Some(item_id);
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                } else {
+                                    if ui.button("▶ Resume Download").clicked() {
+                                        action_resume = Some(item_id);
+                                        ui.close();
+                                    }
+                                    if ui.button("⏸ Stop Download").clicked() {
+                                        action_pause = Some(item_id);
+                                        ui.close();
+                                    }
+                                    if ui.button("⏹ Cancel Download").clicked() {
+                                        action_cancel = Some(item_id);
+                                        ui.close();
+                                    }
+                                    ui.separator();
                                 }
-                                if ui.button("⏸ Stop Download").clicked() {
-                                    action_pause = Some(item_id);
-                                    ui.close();
-                                }
-                                if ui.button("⏹ Cancel Download").clicked() {
-                                    action_cancel = Some(item_id);
-                                    ui.close();
-                                }
-                                ui.separator();
                                 if ui.button("🔍 Download Status & Segments...").clicked() {
                                     action_details = Some(item_id);
                                     ui.close();
@@ -2112,6 +2378,10 @@ impl eframe::App for IdmApp {
                     });
                 }
 
+                if let Some(id) = action_retry_cleanup {
+                    self.selected_id = Some(id);
+                    self.retry_cleanup(id);
+                }
                 if let Some(id) = action_resume {
                     self.selected_id = Some(id);
                     self.resume_selected();
@@ -2233,6 +2503,7 @@ impl IdmApp {
                                 eprintln!("Database error inserting new download: {}", e);
                             }
 
+                            self.mark_task_mutated(item.id);
                             self.downloads.push(item);
                             self.selected_id = Some(id);
 
@@ -2285,6 +2556,7 @@ impl IdmApp {
                                 eprintln!("Database error inserting download later item: {}", e);
                             }
 
+                            self.mark_task_mutated(item.id);
                             self.downloads.push(item);
                             self.show_add_url_modal = false;
                         }
@@ -2389,6 +2661,17 @@ impl IdmApp {
                                     if ui.button("▶ Resume").clicked() {
                                         self.selected_id = Some(item.id);
                                         self.resume_selected();
+                                    }
+                                } else if item.status == DownloadStatus::CleanupPending {
+                                    let retry_btn = egui::Button::new(
+                                        RichText::new("⚠️ Retry Cleanup")
+                                            .color(Color32::WHITE)
+                                            .strong()
+                                    ).fill(Color32::from_rgb(230, 110, 0));
+                                    if ui.add(retry_btn).clicked() {
+                                        self.selected_id = Some(item.id);
+                                        self.retry_cleanup_selected();
+                                        self.show_progress_modal = false;
                                     }
                                 }
 
@@ -3221,6 +3504,7 @@ impl IdmApp {
                                         if let Err(e) = self.db.insert_download(&item, &settings) {
                                             eprintln!("Database error inserting batch item: {}", e);
                                         }
+                                        self.mark_task_mutated(item.id);
                                         self.downloads.push(item);
                                         count += 1;
                                     }
@@ -3258,6 +3542,7 @@ impl IdmApp {
                                         if let Err(e) = self.db.insert_download(&item, &settings) {
                                             eprintln!("Database error inserting batch item: {}", e);
                                         }
+                                        self.mark_task_mutated(item.id);
                                         self.downloads.push(item);
                                         count += 1;
                                     }
@@ -3417,6 +3702,7 @@ impl IdmApp {
                                     if let Err(e) = self.db.insert_download(&item, &settings) {
                                         eprintln!("Database error inserting site grabber item: {}", e);
                                     }
+                                    self.mark_task_mutated(item.id);
                                     self.downloads.push(item);
                                 }
                                 self.set_status("Site Grabber project created".to_string());
@@ -3617,5 +3903,438 @@ impl IdmApp {
                 self.show_about_modal = false;
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test(db: Arc<crate::db::Database>) -> (Self, tokio::sync::mpsc::UnboundedSender<EngineEvent>, tokio::sync::mpsc::UnboundedReceiver<EngineCommand>) {
+        let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (evt_tx, evt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let engine = DownloadEngineHandle {
+            cmd_sender: cmd_tx,
+            event_receiver: evt_rx,
+            active_tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            known_paths: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            active_workers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let config = AppConfig::default();
+        let initial_max_id = db.get_max_download_id().unwrap_or(0);
+
+        (Self {
+            downloads: Vec::new(),
+            selected_id: None,
+            selected_category: Category::All,
+            status_filter: None,
+            queue_filter: None,
+            categories_visible: true,
+            config: config.clone(),
+
+            tree_all_expanded: true,
+            tree_unfinished_expanded: false,
+            tree_finished_expanded: false,
+            tree_grabber_expanded: false,
+            tree_queues_expanded: true,
+
+            show_add_url_modal: false,
+            new_download_url: "https://proof.ovh.net/files/100Mb.dat".to_string(),
+            new_download_category: Category::General,
+            use_authorization: false,
+            auth_login: String::new(),
+            auth_pass: String::new(),
+
+            show_options_modal: false,
+            options_tab: 0,
+            new_site_url: String::new(),
+            new_site_user: String::new(),
+            new_site_pass: String::new(),
+
+            show_scheduler_modal: false,
+            scheduler_start_time: "02:00".to_string(),
+            scheduler_stop_time: "06:00".to_string(),
+            scheduler_active: false,
+
+            show_progress_modal: false,
+            progress_modal_id: None,
+
+            show_about_modal: false,
+            show_registration_modal: false,
+            reg_first_name: String::new(),
+            reg_last_name: String::new(),
+            reg_email: String::new(),
+            reg_serial: String::new(),
+
+            columns: default_columns(),
+            temp_columns: default_columns(),
+            show_columns_modal: false,
+            selected_column_idx: None,
+            column_width_input: "260".to_string(),
+
+            sort_column: None,
+            sort_ascending: true,
+
+            show_batch_download_modal: false,
+            batch_url_pattern: String::new(),
+            batch_is_number: true,
+            batch_from: 1,
+            batch_to: 10,
+            batch_wildcard_size: 2,
+            batch_auth: false,
+            batch_user: String::new(),
+            batch_pass: String::new(),
+
+            show_find_modal: false,
+            find_query: String::new(),
+            find_match_case: false,
+
+            show_speed_limiter_modal: false,
+
+            show_site_grabber_modal: false,
+            grabber_step: 0,
+            grabber_project_name: "MyProject".to_string(),
+            grabber_start_url: String::new(),
+            grabber_save_dir: config.default_download_dir.clone(),
+            grabber_depth: 2,
+            grabber_file_filter: 0,
+
+            scheduler_tab: 0,
+            selected_queue_name: "Main".to_string(),
+            queues_list: vec!["Main".to_string(), "Synchronization".to_string()],
+            new_queue_name_input: String::new(),
+            show_new_queue_input: false,
+            scheduler_periodic: false,
+            scheduler_days: [true, true, true, true, true, true, true],
+            scheduler_retries: 10,
+            scheduler_hang_up: false,
+            scheduler_exit_idm: false,
+            scheduler_turn_off: false,
+            scheduler_force_exit: false,
+            scheduler_on_startup: false,
+            scheduler_open_file: String::new(),
+            scheduler_simultaneous: 1,
+            scheduler_selected_id: None,
+
+            show_tip_modal: false,
+            tip_index: 0,
+            show_update_modal: false,
+            show_drop_target: false,
+            dark_mode: true,
+            status_message: None,
+
+            engine,
+            next_id: initial_max_id + 1,
+            db: db.clone(),
+            is_reconciling: false,
+            reconcile_rx: None,
+            reconcile_handle: None,
+            deleted_task_ids: std::collections::HashSet::new(),
+            deleting_task_ids: std::collections::HashSet::new(),
+            task_versions: std::collections::HashMap::new(),
+            cleanup_errors: std::collections::HashMap::new(),
+
+            screenshot_path: None,
+            frame_counter: 0,
+            screenshot_requested: false,
+            screenshot_saved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }, evt_tx, cmd_rx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+    use crate::types::{DownloadItem, DownloadSettings, DownloadStatus, HashVerificationStatus};
+    use std::sync::Arc;
+
+    fn make_test_item(id: u64, status: DownloadStatus) -> DownloadItem {
+        DownloadItem {
+            id,
+            url: format!("https://example.com/file{}.zip", id),
+            filename: format!("file{}.zip", id),
+            category: Category::General,
+            save_path: PathBuf::from(format!("downloads/file{}.zip", id)),
+            total_size: Some(10_000_000),
+            downloaded_bytes: 0,
+            status,
+            transfer_rate: 0.0,
+            time_left_secs: None,
+            resume_capable: true,
+            date_added: Local::now(),
+            max_connections: 4,
+            segments: vec![],
+            description: String::new(),
+            queue: Some("Main".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_reconciliation_merge_does_not_clobber_user_added_tasks() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        for id in 1..=3 {
+            let item = make_test_item(id, DownloadStatus::Paused);
+            db.insert_download(&item, &DownloadSettings::default()).unwrap();
+        }
+        assert_eq!(db.get_max_download_id().unwrap(), 3);
+
+        let (mut app, _evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+        assert_eq!(app.next_id, 4);
+
+        // User adds task 4 during startup before reconciliation finishes
+        let user_item = make_test_item(4, DownloadStatus::Downloading);
+        db.insert_download(&user_item, &DownloadSettings::default()).unwrap();
+        app.downloads.push(user_item);
+        app.mark_task_mutated(4);
+        app.next_id = 5;
+
+        // Reconciliation snapshot delivers tasks 1, 2, 3
+        let (tx, rx) = std::sync::mpsc::channel();
+        let items = vec![
+            make_test_item(1, DownloadStatus::Paused),
+            make_test_item(2, DownloadStatus::Paused),
+            make_test_item(3, DownloadStatus::Paused),
+        ];
+        tx.send(Ok(items)).unwrap();
+        app.is_reconciling = true;
+        app.reconcile_rx = Some(rx);
+
+        app.check_background_reconciliation();
+
+        assert_eq!(app.downloads.len(), 4, "Must preserve user-added task alongside 3 reconciled tasks");
+        let ids: Vec<u64> = app.downloads.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(app.downloads[3].status, DownloadStatus::Downloading);
+        assert!(app.next_id >= 5);
+    }
+
+    #[test]
+    fn test_reconciliation_tombstone_prevents_resurrection_of_deleted_tasks() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        for id in 1..=3 {
+            let item = make_test_item(id, DownloadStatus::Completed);
+            db.insert_download(&item, &DownloadSettings::default()).unwrap();
+        }
+
+        let (mut app, _evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+
+        // User deletes task 2 during reconciliation window
+        app.deleted_task_ids.insert(2);
+        app.db.delete_download(2).unwrap();
+
+        // Late reconciliation snapshot contains [1, 2, 3]
+        let (tx, rx) = std::sync::mpsc::channel();
+        let items = vec![
+            make_test_item(1, DownloadStatus::Completed),
+            make_test_item(2, DownloadStatus::Completed),
+            make_test_item(3, DownloadStatus::Completed),
+        ];
+        tx.send(Ok(items)).unwrap();
+        app.is_reconciling = true;
+        app.reconcile_rx = Some(rx);
+
+        app.check_background_reconciliation();
+
+        assert_eq!(app.downloads.len(), 2);
+        let ids: Vec<u64> = app.downloads.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec![1, 3], "Task 2 must NOT be resurrected");
+    }
+
+    #[test]
+    fn test_reconciliation_preserves_in_flight_progress_and_mutations() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let item1 = make_test_item(1, DownloadStatus::Paused);
+        db.insert_download(&item1, &DownloadSettings::default()).unwrap();
+
+        let (mut app, _evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+
+        // In-memory task 1 is already downloading and mutated
+        let mut active_item1 = make_test_item(1, DownloadStatus::Downloading);
+        active_item1.downloaded_bytes = 4_500_000;
+        active_item1.transfer_rate = 1_200_000.0;
+        app.downloads.push(active_item1);
+        app.mark_task_mutated(1);
+
+        // Snapshot delivers stale disk state: Paused, 0 bytes, 0 rate
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![make_test_item(1, DownloadStatus::Paused)])).unwrap();
+        app.is_reconciling = true;
+        app.reconcile_rx = Some(rx);
+
+        app.check_background_reconciliation();
+
+        assert_eq!(app.downloads.len(), 1);
+        assert_eq!(app.downloads[0].status, DownloadStatus::Downloading);
+        assert_eq!(app.downloads[0].downloaded_bytes, 4_500_000);
+        assert_eq!(app.downloads[0].transfer_rate, 1_200_000.0);
+    }
+
+    #[test]
+    fn test_deleted_event_cleanup_failure_transitions_to_cleanup_pending() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let item = make_test_item(10, DownloadStatus::Downloading);
+        db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let (mut app, evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+        app.downloads.push(item);
+        app.selected_id = Some(10);
+
+        // Simulate engine reporting deletion failed due to Windows file lock (os error 32)
+        let evt = EngineEvent::Deleted {
+            id: 10,
+            cleanup_success: false,
+            error: Some("The process cannot access the file because it is being used by another process. (os error 32)".into()),
+        };
+        evt_tx.send(evt).unwrap();
+        app.poll_engine_events();
+
+        // Must retain in UI downloads list with status CleanupPending
+        assert_eq!(app.downloads.len(), 1);
+        assert_eq!(app.downloads[0].id, 10);
+        assert_eq!(app.downloads[0].status, DownloadStatus::CleanupPending);
+        assert_eq!(app.downloads[0].transfer_rate, 0.0);
+        assert_eq!(app.downloads[0].time_left_secs, None);
+        assert!(app.cleanup_errors.get(&10).is_some());
+        assert!(!app.deleted_task_ids.contains(&10));
+
+        // SQLite record must NOT be deleted, and status must be CleanupPending
+        assert!(db.download_exists(10).unwrap());
+        let reloaded = db.reconcile_and_load_all().unwrap();
+        assert_eq!(reloaded[0].status, DownloadStatus::CleanupPending);
+    }
+
+    #[test]
+    fn test_retry_cleanup_flow_and_successful_purging() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let item = make_test_item(20, DownloadStatus::CleanupPending);
+        db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let (mut app, evt_tx, mut cmd_rx) = IdmApp::new_for_test(db.clone());
+        app.downloads.push(item);
+        app.selected_id = Some(20);
+        app.cleanup_errors.insert(20, "Locked".into());
+
+        // User clicks retry cleanup
+        app.retry_cleanup_selected();
+        assert!(app.deleting_task_ids.contains(&20));
+        assert_eq!(app.downloads[0].status, DownloadStatus::Error("Cleaning up...".into()));
+
+        // Assert command sent to engine
+        let cmd = cmd_rx.try_recv().unwrap();
+        match cmd {
+            EngineCommand::DeleteDownload { id, cleanup_files } => {
+                assert_eq!(id, 20);
+                assert!(cleanup_files);
+            }
+            _ => panic!("Expected DeleteDownload command"),
+        }
+
+        // Engine confirms cleanup succeeded
+        let evt = EngineEvent::Deleted {
+            id: 20,
+            cleanup_success: true,
+            error: None,
+        };
+        evt_tx.send(evt).unwrap();
+        app.poll_engine_events();
+
+        // Must be purged from UI memory and recorded in tombstones
+        assert_eq!(app.downloads.len(), 0);
+        assert!(app.deleted_task_ids.contains(&20));
+        assert!(!app.deleting_task_ids.contains(&20));
+        assert!(app.cleanup_errors.get(&20).is_none());
+
+        // SQLite record must be expunged
+        assert!(!db.download_exists(20).unwrap());
+    }
+
+    #[test]
+    fn test_finished_event_persists_hash_verification_status() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let item = make_test_item(30, DownloadStatus::Downloading);
+        db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let (mut app, evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+        app.downloads.push(item);
+
+        let evt = EngineEvent::Finished {
+            id: 30,
+            hash_status: HashVerificationStatus::Verified,
+        };
+        evt_tx.send(evt).unwrap();
+        app.poll_engine_events();
+
+        assert_eq!(app.downloads[0].status, DownloadStatus::Completed);
+        assert_eq!(app.downloads[0].hash_status, HashVerificationStatus::Verified);
+
+        // Verification status must be persisted in SQLite
+        let (_, hs) = db.get_hash_status(30).unwrap();
+        assert_eq!(hs, HashVerificationStatus::Verified);
+    }
+
+    #[test]
+    fn test_progress_update_does_not_clobber_terminal_or_paused_states() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut item = make_test_item(40, DownloadStatus::Completed);
+        item.downloaded_bytes = 10_000_000;
+        item.transfer_rate = 0.0;
+        item.time_left_secs = None;
+        db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let (mut app, evt_tx, _cmd_rx) = IdmApp::new_for_test(db);
+        app.downloads.push(item);
+
+        // Out-of-order late ProgressUpdate packet arriving after Finished
+        let evt = EngineEvent::ProgressUpdate {
+            id: 40,
+            downloaded: 9_000_000,
+            speed: 500_000.0,
+            time_left: Some(2),
+            segments: vec![],
+        };
+        evt_tx.send(evt).unwrap();
+        app.poll_engine_events();
+
+        // Progress update must be ignored
+        assert_eq!(app.downloads[0].status, DownloadStatus::Completed);
+        assert_eq!(app.downloads[0].downloaded_bytes, 10_000_000);
+        assert_eq!(app.downloads[0].transfer_rate, 0.0);
+        assert_eq!(app.downloads[0].time_left_secs, None);
+    }
+
+    #[test]
+    fn test_guards_reject_cleanup_pending_for_resume_and_redownload() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let item = make_test_item(50, DownloadStatus::CleanupPending);
+        db.insert_download(&item, &DownloadSettings::default()).unwrap();
+
+        let (mut app, _evt_tx, _cmd_rx) = IdmApp::new_for_test(db);
+        app.downloads.push(item);
+        app.selected_id = Some(50);
+
+        app.resume_selected();
+        assert_eq!(app.downloads[0].status, DownloadStatus::CleanupPending);
+
+        app.redownload_selected();
+        assert_eq!(app.downloads[0].status, DownloadStatus::CleanupPending);
+    }
+
+    #[test]
+    fn test_user_added_task_suppresses_sample_downloads() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let (mut app, _evt_tx, _cmd_rx) = IdmApp::new_for_test(db.clone());
+
+        // User added a task on clean start before reconciliation returned
+        let user_item = make_test_item(1, DownloadStatus::Queued);
+        app.downloads.push(user_item);
+
+        // Background reconciler reports empty DB
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Ok(vec![])).unwrap();
+        app.is_reconciling = true;
+        app.reconcile_rx = Some(rx);
+
+        app.check_background_reconciliation();
+
+        assert_eq!(app.downloads.len(), 1, "Must NOT inject sample downloads when user has already added tasks");
+        assert_eq!(app.downloads[0].id, 1);
     }
 }
