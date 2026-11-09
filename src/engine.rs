@@ -723,23 +723,28 @@ async fn run_download_task(
     let (mut total_size, mut resume_capable, mut discovered_name, mut server_etag) =
         (None, false, None, None);
 
-    if let Ok(resp) = head_resp {
-        if resp.status().is_success() {
-            if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
-                if let Ok(cl_str) = cl.to_str() {
-                    total_size = cl_str.parse::<u64>().ok();
+    match head_resp {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
+                    if let Ok(cl_str) = cl.to_str() {
+                        total_size = cl_str.parse::<u64>().ok();
+                    }
+                }
+                if let Some(ar) = resp.headers().get(reqwest::header::ACCEPT_RANGES) {
+                    if let Ok(ar_str) = ar.to_str() {
+                        resume_capable = ar_str.eq_ignore_ascii_case("bytes");
+                    }
+                }
+                if let Some(et) = resp.headers().get(reqwest::header::ETAG) {
+                    if let Ok(et_str) = et.to_str() {
+                        server_etag = Some(et_str.to_string());
+                    }
                 }
             }
-            if let Some(ar) = resp.headers().get(reqwest::header::ACCEPT_RANGES) {
-                if let Ok(ar_str) = ar.to_str() {
-                    resume_capable = ar_str.eq_ignore_ascii_case("bytes");
-                }
-            }
-            if let Some(et) = resp.headers().get(reqwest::header::ETAG) {
-                if let Ok(et_str) = et.to_str() {
-                    server_etag = Some(et_str.to_string());
-                }
-            }
+        }
+        Err(ref e) => {
+            eprintln!("[DEBUG HEAD ERROR] {:?}", e);
         }
     }
 

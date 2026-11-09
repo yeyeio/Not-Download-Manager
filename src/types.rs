@@ -58,6 +58,13 @@ impl Category {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashVerificationStatus {
+    NotConfigured,
+    Verified,
+    VerificationFailed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadStatus {
     Queued,

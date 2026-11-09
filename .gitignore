@@ -1,6 +1,7 @@
 /target
 /shots
 /docs
+.agents/
 *.bin
 *.log
 benchmark/*.bin
