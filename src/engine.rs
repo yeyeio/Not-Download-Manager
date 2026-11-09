@@ -33,6 +33,10 @@ pub enum EngineCommand {
     CancelDownload {
         id: u64,
     },
+    DeleteDownload {
+        id: u64,
+        cleanup_files: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,49 @@ pub enum EngineEvent {
         id: u64,
         error: String,
     },
+    Paused {
+        id: u64,
+    },
+    Canceled {
+        id: u64,
+    },
+    Deleted {
+        id: u64,
+        cleanup_success: bool,
+        error: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+pub struct TaskControl {
+    pub cancel_flag: Arc<AtomicBool>,
+    pub delete_flag: Arc<AtomicBool>,
+    pub cleanup_files: Arc<AtomicBool>,
+    pub notify: Arc<tokio::sync::Notify>,
+}
+
+impl TaskControl {
+    pub fn new() -> Self {
+        Self {
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            delete_flag: Arc::new(AtomicBool::new(false)),
+            cleanup_files: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+pub struct ActiveTaskGuard {
+    pub id: u64,
+    pub active_tasks: Arc<Mutex<std::collections::HashMap<u64, TaskControl>>>,
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.active_tasks.lock() {
+            map.remove(&self.id);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -457,8 +504,10 @@ pub fn spawn_download_engine() -> DownloadEngineHandle {
                     .unwrap_or_else(|_| reqwest::Client::new()),
             );
 
-            let mut active_cancels: std::collections::HashMap<u64, Arc<AtomicBool>> =
-                std::collections::HashMap::new();
+            let active_tasks: Arc<Mutex<std::collections::HashMap<u64, TaskControl>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
+            let known_paths: Arc<Mutex<std::collections::HashMap<u64, PathBuf>>> =
+                Arc::new(Mutex::new(std::collections::HashMap::new()));
 
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
@@ -468,18 +517,64 @@ pub fn spawn_download_engine() -> DownloadEngineHandle {
                         save_path,
                         connections,
                     } => {
-                        let cancel_flag = Arc::new(AtomicBool::new(false));
-                        active_cancels.insert(id, cancel_flag.clone());
+                        let ctrl = TaskControl::new();
+                        active_tasks.lock().unwrap().insert(id, ctrl.clone());
+                        known_paths.lock().unwrap().insert(id, save_path.clone());
 
                         let evt_sender = evt_tx.clone();
                         let client = shared_client.clone();
+                        let tasks_ref = active_tasks.clone();
                         tokio::spawn(async move {
-                            run_download_task(id, url, save_path, connections, cancel_flag, evt_sender, client).await;
+                            run_download_task(id, url, save_path, connections, ctrl, evt_sender, client, tasks_ref).await;
                         });
                     }
-                    EngineCommand::PauseDownload { id } | EngineCommand::CancelDownload { id } => {
-                        if let Some(flag) = active_cancels.get(&id) {
-                            flag.store(true, Ordering::SeqCst);
+                    EngineCommand::PauseDownload { id } => {
+                        if let Some(ctrl) = active_tasks.lock().unwrap().get(&id) {
+                            ctrl.cancel_flag.store(true, Ordering::SeqCst);
+                            ctrl.notify.notify_waiters();
+                        }
+                    }
+                    EngineCommand::CancelDownload { id } => {
+                        if let Some(ctrl) = active_tasks.lock().unwrap().get(&id) {
+                            ctrl.cancel_flag.store(true, Ordering::SeqCst);
+                            ctrl.notify.notify_waiters();
+                        }
+                    }
+                    EngineCommand::DeleteDownload { id, cleanup_files } => {
+                        let maybe_ctrl = active_tasks.lock().unwrap().get(&id).cloned();
+                        if let Some(ctrl) = maybe_ctrl {
+                            // Active task: signal Delete so coordinator orchestrates safe teardown & cleanup
+                            ctrl.cleanup_files.store(cleanup_files, Ordering::SeqCst);
+                            ctrl.delete_flag.store(true, Ordering::SeqCst);
+                            ctrl.cancel_flag.store(true, Ordering::SeqCst);
+                            ctrl.notify.notify_waiters();
+                        } else {
+                            // Inactive task: clean up files directly if requested
+                            let save_path = known_paths.lock().unwrap().remove(&id);
+                            let mut cleanup_success = true;
+                            let mut err_msg = None;
+
+                            if cleanup_files {
+                                if let Some(path) = save_path {
+                                    let mut partinfo = path.clone();
+                                    partinfo.set_file_name(format!("{}.partinfo", path.file_name().unwrap_or_default().to_string_lossy()));
+                                    let _ = tokio::fs::remove_file(&partinfo).await;
+                                    let tmp_partinfo = partinfo.with_extension("tmp");
+                                    let _ = tokio::fs::remove_file(&tmp_partinfo).await;
+                                    if path.exists() {
+                                        if let Err(e) = tokio::fs::remove_file(&path).await {
+                                            cleanup_success = false;
+                                            err_msg = Some(format!("Failed to delete {}: {}", path.display(), e));
+                                        }
+                                    }
+                                }
+                            }
+
+                            let _ = evt_tx.send(EngineEvent::Deleted {
+                                id,
+                                cleanup_success,
+                                error: err_msg,
+                            });
                         }
                     }
                 }
@@ -597,10 +692,32 @@ async fn run_download_task(
     url: String,
     save_path: PathBuf,
     connections: usize,
-    cancel_flag: Arc<AtomicBool>,
+    ctrl: TaskControl,
     evt_sender: mpsc::UnboundedSender<EngineEvent>,
     client: Arc<reqwest::Client>,
+    active_tasks: Arc<Mutex<std::collections::HashMap<u64, TaskControl>>>,
 ) {
+    let _guard = ActiveTaskGuard {
+        id,
+        active_tasks: active_tasks.clone(),
+    };
+    let cancel_flag = ctrl.cancel_flag.clone();
+    let delete_flag = ctrl.delete_flag.clone();
+
+    if delete_flag.load(Ordering::SeqCst) {
+        if ctrl.cleanup_files.load(Ordering::SeqCst) {
+            let mut partinfo = save_path.clone();
+            partinfo.set_file_name(format!("{}.partinfo", save_path.file_name().unwrap_or_default().to_string_lossy()));
+            let _ = tokio::fs::remove_file(&partinfo).await;
+            let _ = tokio::fs::remove_file(partinfo.with_extension("tmp")).await;
+            let _ = tokio::fs::remove_file(&save_path).await;
+        }
+        let _ = evt_sender.send(EngineEvent::Deleted { id, cleanup_success: true, error: None });
+        return;
+    }
+    if cancel_flag.load(Ordering::SeqCst) {
+        return;
+    }
     // 1. Probe HEAD for content length, resume capability, and ETag
     let head_resp = client.head(&url).send().await;
     let (mut total_size, mut resume_capable, mut discovered_name, mut server_etag) =
@@ -685,6 +802,19 @@ async fn run_download_task(
         resume_capable,
         segments: initial_ui_segs,
     });
+
+    if delete_flag.load(Ordering::SeqCst) {
+        if ctrl.cleanup_files.load(Ordering::SeqCst) {
+            let _ = tokio::fs::remove_file(&partinfo_path).await;
+            let _ = tokio::fs::remove_file(partinfo_path.with_extension("tmp")).await;
+            let _ = tokio::fs::remove_file(&save_path).await;
+        }
+        let _ = evt_sender.send(EngineEvent::Deleted { id, cleanup_success: true, error: None });
+        return;
+    }
+    if cancel_flag.load(Ordering::SeqCst) {
+        return;
+    }
 
     // 3. Storage preallocation & setup
     if let Some(parent) = save_path.parent() {
@@ -777,13 +907,14 @@ async fn run_download_task(
             let url = url.clone();
             let write_tx = write_tx.clone();
             let cancel_flag = cancel_flag.clone();
+            let delete_flag = delete_flag.clone();
             let error_flag = error_flag.clone();
             let fatal_err = fatal_error_msg.clone();
             let tracker = worker_trackers[worker_id].clone();
             let total = total_size;
 
             let handle = tokio::spawn(async move {
-                while !cancel_flag.load(Ordering::SeqCst) && !error_flag.load(Ordering::Relaxed) {
+                while !cancel_flag.load(Ordering::SeqCst) && !delete_flag.load(Ordering::SeqCst) && !error_flag.load(Ordering::Relaxed) {
                     // Pull next work chunk from SegmentManager
                     let lease = {
                         let mut m = mgr.lock().unwrap();
@@ -801,7 +932,7 @@ async fn run_download_task(
                     let mut retries = 0;
                     let mut chunk_succeeded = false;
 
-                    while retries <= MAX_CHUNK_RETRIES && !cancel_flag.load(Ordering::SeqCst) {
+                    while retries <= MAX_CHUNK_RETRIES && !cancel_flag.load(Ordering::SeqCst) && !delete_flag.load(Ordering::SeqCst) {
                         let range_hdr = format!("bytes={}-{}", lease.start, lease.end - 1);
                         let req = client.get(&url).header(reqwest::header::RANGE, range_hdr);
 
@@ -858,7 +989,7 @@ async fn run_download_task(
                         let mut stream_err = false;
 
                         while let Some(chunk_res) = resp.chunk().await.transpose() {
-                            if cancel_flag.load(Ordering::SeqCst) || error_flag.load(Ordering::Relaxed) {
+                            if cancel_flag.load(Ordering::SeqCst) || delete_flag.load(Ordering::SeqCst) || error_flag.load(Ordering::Relaxed) {
                                 return;
                             }
 
@@ -910,7 +1041,7 @@ async fn run_download_task(
                         break;
                     }
 
-                    if !chunk_succeeded && !cancel_flag.load(Ordering::SeqCst) {
+                    if !chunk_succeeded && !cancel_flag.load(Ordering::SeqCst) && !delete_flag.load(Ordering::SeqCst) {
                         let mut m = mgr.lock().unwrap();
                         if let Err(e) = m.return_failed_chunk(lease.chunk_id, lease.generation, false) {
                             *fatal_err.lock().unwrap() = Some(e);
@@ -929,6 +1060,7 @@ async fn run_download_task(
         let url = url.clone();
         let write_tx = write_tx.clone();
         let cancel_flag = cancel_flag.clone();
+        let delete_flag = delete_flag.clone();
         let error_flag = error_flag.clone();
         let done_flag = done_flag.clone();
         let fatal_err = fatal_error_msg.clone();
@@ -956,7 +1088,7 @@ async fn run_download_task(
             let mut curr = 0u64;
 
             while let Some(chunk_res) = resp.chunk().await.transpose() {
-                if cancel_flag.load(Ordering::SeqCst) || error_flag.load(Ordering::Relaxed) {
+                if cancel_flag.load(Ordering::SeqCst) || delete_flag.load(Ordering::SeqCst) || error_flag.load(Ordering::Relaxed) {
                     return;
                 }
 
@@ -1016,8 +1148,12 @@ async fn run_download_task(
     let mut last_downloaded: u64 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
 
+    let notify = ctrl.notify.clone();
+
     loop {
         tokio::select! {
+            _ = notify.notified() => {}
+
             // Process Commit ACKs from Writer Actor
             Some(ack) = ack_rx.recv() => {
                 if ack.success {
@@ -1026,81 +1162,142 @@ async fn run_download_task(
                 }
             }
 
-            _ = interval.tick() => {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    let cp = { manager_arc.lock().unwrap().to_checkpoint() };
-                    write_checkpoint_atomic(&partinfo_path, &cp).await;
-                    return;
-                }
-
-                if error_flag.load(Ordering::Relaxed) {
-                    let err = fatal_error_msg
-                        .lock()
-                        .unwrap()
-                        .clone()
-                        .unwrap_or_else(|| "Download failed".into());
-                    let _ = evt_sender.send(EngineEvent::Failed { id, error: err });
-                    return;
-                }
-
-                // Check completion
-                let (is_done, committed, _total) = {
-                    let m = manager_arc.lock().unwrap();
-                    (m.is_all_committed(), m.committed_bytes, m.total_size)
-                };
-
-                if (is_done && total_size.is_some()) || done_flag.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                // Periodic crash-consistent checkpoint flush every 1 second
-                if last_checkpoint.elapsed() >= Duration::from_secs(1) {
-                    let cp = { manager_arc.lock().unwrap().to_checkpoint() };
-                    write_checkpoint_atomic(&partinfo_path, &cp).await;
-                    last_checkpoint = std::time::Instant::now();
-                }
-
-                // Compute speed and UI progress
-                let dt = last_emit.elapsed().as_secs_f64();
-                let speed = if dt > 0.0 {
-                    (committed.saturating_sub(last_downloaded)) as f64 / dt
-                } else {
-                    0.0
-                };
-
-                let time_left = if let Some(tot) = total_size {
-                    if speed > 100.0 {
-                        Some((tot.saturating_sub(committed) as f64 / speed) as u64)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                let active_pairs: Vec<(usize, u64, u64)> = worker_trackers
-                    .iter()
-                    .enumerate()
-                    .map(|(w, t)| (w, t.load(Ordering::Relaxed), 0))
-                    .collect();
-
-                let ui_segs = {
-                    let m = manager_arc.lock().unwrap();
-                    m.generate_ui_segments(conn_count, &active_pairs)
-                };
-
-                let _ = evt_sender.send(EngineEvent::ProgressUpdate {
-                    id,
-                    downloaded: committed,
-                    speed,
-                    time_left,
-                    segments: ui_segs,
-                });
-
-                last_emit = std::time::Instant::now();
-                last_downloaded = committed;
-            }
+            _ = interval.tick() => {}
         }
+
+        // P0: Safe Delete Lifecycle
+        if delete_flag.load(Ordering::SeqCst) {
+            // 1. Drain remaining in-flight ACKs
+            while let Ok(ack) = ack_rx.try_recv() {
+                if ack.success {
+                    let mut m = manager_arc.lock().unwrap();
+                    let _ = m.commit_chunk(ack.chunk_id, ack.generation);
+                }
+            }
+
+            // 2. Await all workers to release network sockets
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+
+            // 3. Await Writer Actor to flush and close file handle on Windows
+            let _ = writer_handle.await;
+
+            // 4. Suppress all future checkpoint writes!
+            let mut cleanup_success = true;
+            let mut err_msg = None;
+            if ctrl.cleanup_files.load(Ordering::SeqCst) {
+                let _ = tokio::fs::remove_file(&partinfo_path).await;
+                let tmp_partinfo = partinfo_path.with_extension("tmp");
+                let _ = tokio::fs::remove_file(&tmp_partinfo).await;
+                if save_path.exists() {
+                    if let Err(e) = tokio::fs::remove_file(&save_path).await {
+                        cleanup_success = false;
+                        err_msg = Some(format!("Failed to delete {}: {}", save_path.display(), e));
+                    }
+                }
+            }
+
+            let _ = evt_sender.send(EngineEvent::Deleted {
+                id,
+                cleanup_success,
+                error: err_msg,
+            });
+            return;
+        }
+
+        // Safe Pause / Cancel Lifecycle
+        if cancel_flag.load(Ordering::SeqCst) {
+            while let Ok(ack) = ack_rx.try_recv() {
+                if ack.success {
+                    let mut m = manager_arc.lock().unwrap();
+                    let _ = m.commit_chunk(ack.chunk_id, ack.generation);
+                }
+            }
+
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+
+            let _ = writer_handle.await;
+
+            let cp = { manager_arc.lock().unwrap().to_checkpoint() };
+            write_checkpoint_atomic(&partinfo_path, &cp).await;
+
+            let _ = evt_sender.send(EngineEvent::Paused { id });
+            return;
+        }
+
+        if error_flag.load(Ordering::Relaxed) {
+            for handle in worker_handles {
+                let _ = handle.await;
+            }
+            let _ = writer_handle.await;
+            let err = fatal_error_msg
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_else(|| "Download failed".into());
+            let _ = evt_sender.send(EngineEvent::Failed { id, error: err });
+            return;
+        }
+
+        // Check completion
+        let (is_done, committed, _total) = {
+            let m = manager_arc.lock().unwrap();
+            (m.is_all_committed(), m.committed_bytes, m.total_size)
+        };
+
+        if (is_done && total_size.is_some()) || done_flag.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Periodic crash-consistent checkpoint flush every 1 second
+        if last_checkpoint.elapsed() >= Duration::from_secs(1) {
+            let cp = { manager_arc.lock().unwrap().to_checkpoint() };
+            write_checkpoint_atomic(&partinfo_path, &cp).await;
+            last_checkpoint = std::time::Instant::now();
+        }
+
+        // Compute speed and UI progress
+        let dt = last_emit.elapsed().as_secs_f64();
+        let speed = if dt > 0.0 {
+            (committed.saturating_sub(last_downloaded)) as f64 / dt
+        } else {
+            0.0
+        };
+
+        let time_left = if let Some(tot) = total_size {
+            if speed > 100.0 {
+                Some((tot.saturating_sub(committed) as f64 / speed) as u64)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let active_pairs: Vec<(usize, u64, u64)> = worker_trackers
+            .iter()
+            .enumerate()
+            .map(|(w, t)| (w, t.load(Ordering::Relaxed), 0))
+            .collect();
+
+        let ui_segs = {
+            let m = manager_arc.lock().unwrap();
+            m.generate_ui_segments(conn_count, &active_pairs)
+        };
+
+        let _ = evt_sender.send(EngineEvent::ProgressUpdate {
+            id,
+            downloaded: committed,
+            speed,
+            time_left,
+            segments: ui_segs,
+        });
+
+        last_emit = std::time::Instant::now();
+        last_downloaded = committed;
     }
 
     // Drain remaining ACKs
@@ -1121,6 +1318,8 @@ async fn run_download_task(
         Ok(Ok(())) => {
             // Clean up checkpoint file on successful completion
             let _ = tokio::fs::remove_file(&partinfo_path).await;
+            let tmp_partinfo = partinfo_path.with_extension("tmp");
+            let _ = tokio::fs::remove_file(&tmp_partinfo).await;
 
             let final_downloaded = total_size.unwrap_or(last_downloaded);
             let final_ui_segs = {
@@ -1211,7 +1410,7 @@ mod tests {
         let mut mgr = SegmentManager::new(total, 2_000_000, Some("etag_123".into()));
 
         let l0 = mgr.lease_next_chunk(0).unwrap();
-        let l1 = mgr.lease_next_chunk(1).unwrap();
+        let _l1 = mgr.lease_next_chunk(1).unwrap();
         mgr.commit_chunk(l0.chunk_id, l0.generation).unwrap();
 
         assert_eq!(mgr.committed_bytes, 2_000_000);

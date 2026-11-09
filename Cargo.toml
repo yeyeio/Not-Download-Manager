@@ -28,3 +28,7 @@ path = "src/main.rs"
 name = "bench_engine"
 path = "src/bin/bench_engine.rs"
 
+[[bin]]
+name = "bench_remediation"
+path = "src/bin/bench_remediation.rs"
+

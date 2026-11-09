@@ -2,7 +2,7 @@
 
 use crate::engine::*;
 use crate::types::*;
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32, Panel, RichText, Vec2};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -133,10 +133,12 @@ pub struct IdmApp {
     pub dark_mode: bool,
     pub status_message: Option<(String, std::time::Instant)>,
 
-    // Background download engine
+    // Background download engine & persistence
     pub engine: DownloadEngineHandle,
     pub next_id: u64,
     pub db: Arc<crate::db::Database>,
+    pub is_reconciling: bool,
+    pub reconcile_rx: Option<std::sync::mpsc::Receiver<Result<Vec<DownloadItem>, String>>>,
 
     // Headless / screenshot handling
     pub screenshot_path: Option<PathBuf>,
@@ -160,7 +162,16 @@ impl IdmApp {
             crate::db::Database::open_in_memory().expect("In-memory DB must open")
         }));
 
-        let mut app = Self {
+        let (rec_tx, rec_rx) = std::sync::mpsc::channel();
+        let db_for_rec = db.clone();
+        std::thread::spawn(move || {
+            let res = db_for_rec
+                .reconcile_and_load_all()
+                .map_err(|e| format!("Reconciliation failed: {}", e));
+            let _ = rec_tx.send(res);
+        });
+
+        let app = Self {
             downloads: Vec::new(),
             selected_id: None,
             selected_category: Category::All,
@@ -270,7 +281,9 @@ impl IdmApp {
 
             engine,
             next_id: 1,
-            db,
+            db: db.clone(),
+            is_reconciling: true,
+            reconcile_rx: Some(rec_rx),
 
             screenshot_path,
             frame_counter: 0,
@@ -278,20 +291,35 @@ impl IdmApp {
             screenshot_saved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
-        app.populate_sample_downloads();
         app
     }
 
-    fn populate_sample_downloads(&mut self) {
-        let existing = self.db.reconcile_and_load_all().unwrap_or_default();
-        if !existing.is_empty() || self.db.get_download_count().unwrap_or(0) > 0 {
-            let max_id = existing.iter().map(|d| d.id).max().unwrap_or(0);
-            self.downloads = existing;
-            self.next_id = max_id + 1;
-            self.selected_id = self.downloads.first().map(|d| d.id);
-            return;
+    pub fn check_background_reconciliation(&mut self) {
+        if let Some(ref rx) = self.reconcile_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.is_reconciling = false;
+                self.reconcile_rx = None;
+                match res {
+                    Ok(items) => {
+                        if !items.is_empty() || self.db.get_download_count().unwrap_or(0) > 0 {
+                            let max_id = items.iter().map(|d| d.id).max().unwrap_or(0);
+                            self.downloads = items;
+                            self.next_id = max_id + 1;
+                            self.selected_id = self.downloads.first().map(|d| d.id);
+                        } else {
+                            self.populate_default_sample_downloads();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Startup reconciliation error: {}", e);
+                        self.set_status(format!("Reconciliation warning: {}", e));
+                    }
+                }
+            }
         }
+    }
 
+    fn populate_default_sample_downloads(&mut self) {
         // High fidelity sample downloads matching picture-3.png from the original IDM
         let base_time = Local::now();
 
@@ -631,13 +659,16 @@ impl IdmApp {
                 speed_limit: None,
                 retry_limit: 5,
             };
-            let _ = self.db.insert_download(item, &settings);
+            if let Err(e) = self.db.insert_download(item, &settings) {
+                eprintln!("Database error inserting sample download #{}: {}", item.id, e);
+            }
         }
         self.selected_id = Some(15);
         self.next_id = 17;
     }
 
     pub fn poll_engine_events(&mut self) {
+        self.check_background_reconciliation();
         while let Ok(evt) = self.engine.event_receiver.try_recv() {
             match evt {
                 EngineEvent::MetadataDiscovered {
@@ -647,8 +678,12 @@ impl IdmApp {
                     resume_capable,
                     segments,
                 } => {
-                    let _ = self.db.update_metadata(id, &filename, total_size, None, None);
-                    let _ = self.db.update_status(id, &DownloadStatus::Downloading);
+                    if let Err(e) = self.db.update_metadata(id, &filename, total_size, None, None) {
+                        eprintln!("Database error updating metadata for #{}: {}", id, e);
+                    }
+                    if let Err(e) = self.db.update_status(id, &DownloadStatus::Downloading) {
+                        eprintln!("Database error updating status for #{}: {}", id, e);
+                    }
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.filename = filename;
                         item.total_size = total_size;
@@ -674,7 +709,9 @@ impl IdmApp {
                     }
                 }
                 EngineEvent::Finished { id } => {
-                    let _ = self.db.mark_completed(id);
+                    if let Err(e) = self.db.mark_completed(id) {
+                        eprintln!("Database error marking #{}: completed: {}", id, e);
+                    }
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Completed;
                         item.transfer_rate = 0.0;
@@ -685,10 +722,49 @@ impl IdmApp {
                     }
                 }
                 EngineEvent::Failed { id, error } => {
-                    let _ = self.db.mark_failed(id, &error);
+                    if let Err(e) = self.db.mark_failed(id, &error) {
+                        eprintln!("Database error marking #{}: failed: {}", id, e);
+                    }
                     if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                         item.status = DownloadStatus::Error(error);
                         item.transfer_rate = 0.0;
+                    }
+                }
+                EngineEvent::Paused { id } => {
+                    if let Err(e) = self.db.update_status(id, &DownloadStatus::Paused) {
+                        eprintln!("Database error updating status to Paused for #{}: {}", id, e);
+                    }
+                    if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                        item.status = DownloadStatus::Paused;
+                        item.transfer_rate = 0.0;
+                    }
+                }
+                EngineEvent::Canceled { id } => {
+                    if let Err(e) = self.db.update_status(id, &DownloadStatus::Canceled) {
+                        eprintln!("Database error updating status to Canceled for #{}: {}", id, e);
+                    }
+                    if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                        item.status = DownloadStatus::Canceled;
+                        item.transfer_rate = 0.0;
+                    }
+                }
+                EngineEvent::Deleted {
+                    id,
+                    cleanup_success,
+                    error,
+                } => {
+                    // Safe Delete lifecycle: SQLite record is deleted ONLY after engine confirms file cleanup
+                    if let Err(e) = self.db.delete_download(id) {
+                        eprintln!("Database error deleting download #{}: {}", id, e);
+                    }
+                    self.downloads.retain(|d| d.id != id);
+                    if self.selected_id == Some(id) {
+                        self.selected_id = self.downloads.first().map(|d| d.id);
+                    }
+                    if cleanup_success {
+                        self.set_status(format!("Download #{} deleted successfully", id));
+                    } else if let Some(err) = error {
+                        self.set_status(format!("Download #{} deleted with notice: {}", id, err));
                     }
                 }
             }
@@ -700,13 +776,17 @@ impl IdmApp {
             if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
                 if item.status != DownloadStatus::Completed && item.status != DownloadStatus::Downloading {
                     item.status = DownloadStatus::Connecting;
-                    let _ = self.db.update_status(item.id, &DownloadStatus::Downloading);
-                    let _ = self.engine.cmd_sender.send(EngineCommand::StartDownload {
+                    if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Downloading) {
+                        eprintln!("Database error updating status for #{}: {}", item.id, e);
+                    }
+                    if let Err(e) = self.engine.cmd_sender.send(EngineCommand::StartDownload {
                         id: item.id,
                         url: item.url.clone(),
                         save_path: item.save_path.clone(),
                         connections: item.max_connections,
-                    });
+                    }) {
+                        eprintln!("Engine error sending StartDownload for #{}: {}", item.id, e);
+                    }
                 }
             }
         }
@@ -718,8 +798,12 @@ impl IdmApp {
                 if item.status == DownloadStatus::Downloading || item.status == DownloadStatus::Connecting {
                     item.status = DownloadStatus::Paused;
                     item.transfer_rate = 0.0;
-                    let _ = self.db.update_status(item.id, &DownloadStatus::Paused);
-                    let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id });
+                    if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Paused) {
+                        eprintln!("Database error updating status for #{}: {}", item.id, e);
+                    }
+                    if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id }) {
+                        eprintln!("Engine error sending PauseDownload for #{}: {}", item.id, e);
+                    }
                 }
             }
         }
@@ -732,8 +816,12 @@ impl IdmApp {
                 item.status = DownloadStatus::Canceled;
                 item.transfer_rate = 0.0;
                 info = Some((item.id, item.filename.clone()));
-                let _ = self.db.update_status(item.id, &DownloadStatus::Canceled);
-                let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: item.id });
+                if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Canceled) {
+                    eprintln!("Database error updating status for #{}: {}", item.id, e);
+                }
+                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::CancelDownload { id: item.id }) {
+                    eprintln!("Engine error sending CancelDownload for #{}: {}", item.id, e);
+                }
             }
             if let Some((item_id, filename)) = info {
                 self.set_status(format!("Canceled download #{} ({})", item_id, filename));
@@ -743,31 +831,32 @@ impl IdmApp {
 
     pub fn delete_selected(&mut self) {
         if let Some(id) = self.selected_id {
-            let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id });
-            let _ = self.db.delete_download(id);
-
-            // Clean up .partinfo checkpoint file
-            if let Some(item) = self.downloads.iter().find(|d| d.id == id) {
-                let mut partinfo = item.save_path.clone();
-                partinfo.set_file_name(format!("{}.partinfo", item.save_path.file_name().unwrap_or_default().to_string_lossy()));
-                let _ = std::fs::remove_file(partinfo);
+            // Signal engine to stop leases, await workers & writer actor, suppress checkpoints, and clean up files
+            if let Err(e) = self.engine.cmd_sender.send(EngineCommand::DeleteDownload { id, cleanup_files: true }) {
+                eprintln!("Engine error sending DeleteDownload for #{}: {}", id, e);
             }
-
-            self.downloads.retain(|d| d.id != id);
-            self.selected_id = self.downloads.first().map(|d| d.id);
+            // Mark visually as Deleting while engine confirms file teardown
+            if let Some(item) = self.downloads.iter_mut().find(|d| d.id == id) {
+                item.status = DownloadStatus::Error("Deleting...".into());
+                item.transfer_rate = 0.0;
+            }
+            self.set_status(format!("Deleting download #{}...", id));
         }
     }
 
     pub fn delete_completed(&mut self) {
-        let completed_ids: Vec<u64> = self.downloads.iter()
-            .filter(|d| d.status == DownloadStatus::Completed)
-            .map(|d| d.id)
-            .collect();
-        for id in completed_ids {
-            let _ = self.db.delete_download(id);
+        // Optimize delete_completed() using single atomic SQL query
+        match self.db.delete_completed_downloads() {
+            Ok(count) => {
+                self.downloads.retain(|d| d.status != DownloadStatus::Completed);
+                self.selected_id = self.downloads.first().map(|d| d.id);
+                self.set_status(format!("Removed {} completed download(s) from history", count));
+            }
+            Err(e) => {
+                eprintln!("Database error deleting completed downloads: {}", e);
+                self.set_status(format!("Database error deleting completed downloads: {}", e));
+            }
         }
-        self.downloads.retain(|d| d.status != DownloadStatus::Completed);
-        self.selected_id = self.downloads.first().map(|d| d.id);
     }
 
     pub fn set_status(&mut self, msg: String) {
@@ -782,13 +871,17 @@ impl IdmApp {
                 item.status = DownloadStatus::Connecting;
                 item.transfer_rate = 0.0;
                 fname = Some(item.filename.clone());
-                let _ = self.db.update_status(item.id, &DownloadStatus::Downloading);
-                let _ = self.engine.cmd_sender.send(EngineCommand::StartDownload {
+                if let Err(e) = self.db.update_status(item.id, &DownloadStatus::Downloading) {
+                    eprintln!("Database error updating status for #{}: {}", item.id, e);
+                }
+                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::StartDownload {
                     id: item.id,
                     url: item.url.clone(),
                     save_path: item.save_path.clone(),
                     connections: item.max_connections,
-                });
+                }) {
+                    eprintln!("Engine error sending StartDownload for #{}: {}", item.id, e);
+                }
             }
             if let Some(name) = fname {
                 self.set_status(format!("Redownloading {}", name));
@@ -840,7 +933,9 @@ impl IdmApp {
                     speed_limit: None,
                     retry_limit: 5,
                 };
-                let _ = self.db.insert_download(&item, &settings);
+                if let Err(e) = self.db.insert_download(&item, &settings) {
+                    eprintln!("Database error inserting download from clipboard: {}", e);
+                }
                 self.downloads.push(item);
                 added += 1;
             }
@@ -925,7 +1020,9 @@ impl IdmApp {
                         speed_limit: None,
                         retry_limit: 5,
                     };
-                    let _ = self.db.insert_download(&item, &settings);
+                    if let Err(e) = self.db.insert_download(&item, &settings) {
+                        eprintln!("Database error inserting imported download: {}", e);
+                    }
                     self.downloads.push(item);
                     count += 1;
                 }
@@ -1026,6 +1123,9 @@ impl eframe::App for IdmApp {
         }
 
         self.poll_engine_events();
+        if self.is_reconciling {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         // Screenshot capture logic
         if self.screenshot_path.is_some() {
@@ -1163,8 +1263,12 @@ impl eframe::App for IdmApp {
                         for d in &mut self.downloads {
                             if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                                 d.status = DownloadStatus::Paused;
-                                let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
-                                let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
+                                if let Err(e) = self.db.update_status(d.id, &DownloadStatus::Paused) {
+                                    eprintln!("Database error pausing download #{}: {}", d.id, e);
+                                }
+                                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id }) {
+                                    eprintln!("Engine error sending PauseDownload for #{}: {}", d.id, e);
+                                }
                             }
                         }
                         ui.close();
@@ -1173,8 +1277,12 @@ impl eframe::App for IdmApp {
                         for d in &mut self.downloads {
                             if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                                 d.status = DownloadStatus::Paused;
-                                let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
-                                let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
+                                if let Err(e) = self.db.update_status(d.id, &DownloadStatus::Paused) {
+                                    eprintln!("Database error stopping download #{}: {}", d.id, e);
+                                }
+                                if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id }) {
+                                    eprintln!("Engine error sending PauseDownload for #{}: {}", d.id, e);
+                                }
                             }
                         }
                         ui.close();
@@ -1410,8 +1518,12 @@ impl eframe::App for IdmApp {
                     for d in &mut self.downloads {
                         if d.status == DownloadStatus::Downloading || d.status == DownloadStatus::Connecting {
                             d.status = DownloadStatus::Paused;
-                            let _ = self.db.update_status(d.id, &DownloadStatus::Paused);
-                            let _ = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id });
+                            if let Err(e) = self.db.update_status(d.id, &DownloadStatus::Paused) {
+                                eprintln!("Database error stopping download #{}: {}", d.id, e);
+                            }
+                            if let Err(e) = self.engine.cmd_sender.send(EngineCommand::PauseDownload { id: d.id }) {
+                                eprintln!("Engine error sending PauseDownload for #{}: {}", d.id, e);
+                            }
                         }
                     }
                 }
@@ -1524,7 +1636,11 @@ impl eframe::App for IdmApp {
                 } else {
                     ui.label("Limiter: Off");
                 }
-                if let Some((ref msg, instant)) = self.status_message {
+                if self.is_reconciling {
+                    ui.separator();
+                    ui.spinner();
+                    ui.colored_label(Color32::from_rgb(255, 180, 0), "Reconciling database & checkpoints...");
+                } else if let Some((ref msg, instant)) = self.status_message {
                     if instant.elapsed().as_secs() < 5 {
                         ui.separator();
                         ui.colored_label(Color32::from_rgb(0, 120, 215), msg);
@@ -1729,6 +1845,13 @@ impl eframe::App for IdmApp {
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.is_reconciling {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.colored_label(Color32::from_rgb(255, 180, 0), "Reconciling download tasks from database and checking checkpoints...");
+                });
+                ui.add_space(4.0);
+            }
             let visible_indices: Vec<usize> = self.columns.iter()
                 .enumerate()
                 .filter(|(_, c)| c.visible)
@@ -2106,17 +2229,21 @@ impl IdmApp {
                                 speed_limit: None,
                                 retry_limit: 5,
                             };
-                            let _ = self.db.insert_download(&item, &settings);
+                            if let Err(e) = self.db.insert_download(&item, &settings) {
+                                eprintln!("Database error inserting new download: {}", e);
+                            }
 
                             self.downloads.push(item);
                             self.selected_id = Some(id);
 
-                            let _ = self.engine.cmd_sender.send(EngineCommand::StartDownload {
+                            if let Err(e) = self.engine.cmd_sender.send(EngineCommand::StartDownload {
                                 id,
                                 url: self.new_download_url.clone(),
                                 save_path,
                                 connections: self.config.default_connections,
-                            });
+                            }) {
+                                eprintln!("Engine error sending StartDownload: {}", e);
+                            }
 
                             self.show_add_url_modal = false;
                         }
@@ -2154,7 +2281,9 @@ impl IdmApp {
                                 speed_limit: None,
                                 retry_limit: 5,
                             };
-                            let _ = self.db.insert_download(&item, &settings);
+                            if let Err(e) = self.db.insert_download(&item, &settings) {
+                                eprintln!("Database error inserting download later item: {}", e);
+                            }
 
                             self.downloads.push(item);
                             self.show_add_url_modal = false;
@@ -3089,7 +3218,9 @@ impl IdmApp {
                                             speed_limit: None,
                                             retry_limit: 5,
                                         };
-                                        let _ = self.db.insert_download(&item, &settings);
+                                        if let Err(e) = self.db.insert_download(&item, &settings) {
+                                            eprintln!("Database error inserting batch item: {}", e);
+                                        }
                                         self.downloads.push(item);
                                         count += 1;
                                     }
@@ -3124,7 +3255,9 @@ impl IdmApp {
                                             speed_limit: None,
                                             retry_limit: 5,
                                         };
-                                        let _ = self.db.insert_download(&item, &settings);
+                                        if let Err(e) = self.db.insert_download(&item, &settings) {
+                                            eprintln!("Database error inserting batch item: {}", e);
+                                        }
                                         self.downloads.push(item);
                                         count += 1;
                                     }
@@ -3281,7 +3414,9 @@ impl IdmApp {
                                         speed_limit: None,
                                         retry_limit: 5,
                                     };
-                                    let _ = self.db.insert_download(&item, &settings);
+                                    if let Err(e) = self.db.insert_download(&item, &settings) {
+                                        eprintln!("Database error inserting site grabber item: {}", e);
+                                    }
                                     self.downloads.push(item);
                                 }
                                 self.set_status("Site Grabber project created".to_string());
