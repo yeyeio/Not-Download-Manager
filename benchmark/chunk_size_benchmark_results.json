@@ -1,0 +1,102 @@
+{
+  "512 KB": {
+    "chunk_size_bytes": 524288,
+    "requests_count": 200,
+    "median_duration_s": 0.3506,
+    "median_throughput_mb_s": 285.24,
+    "median_peak_ram_mb": 15.1,
+    "sha_match": true,
+    "all_runs": [
+      {
+        "dur": 0.8514,
+        "mb_s": 117.45,
+        "ram_mb": 15.1
+      },
+      {
+        "dur": 0.3506,
+        "mb_s": 285.24,
+        "ram_mb": 15.66
+      },
+      {
+        "dur": 0.3395,
+        "mb_s": 294.58,
+        "ram_mb": 14.69
+      }
+    ]
+  },
+  "1 MB": {
+    "chunk_size_bytes": 1048576,
+    "requests_count": 100,
+    "median_duration_s": 0.2441,
+    "median_throughput_mb_s": 409.62,
+    "median_peak_ram_mb": 51.14,
+    "sha_match": true,
+    "all_runs": [
+      {
+        "dur": 0.2443,
+        "mb_s": 409.29,
+        "ram_mb": 47.35
+      },
+      {
+        "dur": 0.2388,
+        "mb_s": 418.77,
+        "ram_mb": 51.14
+      },
+      {
+        "dur": 0.2441,
+        "mb_s": 409.62,
+        "ram_mb": 52.55
+      }
+    ]
+  },
+  "2 MB": {
+    "chunk_size_bytes": 2097152,
+    "requests_count": 50,
+    "median_duration_s": 0.2431,
+    "median_throughput_mb_s": 411.33,
+    "median_peak_ram_mb": 68.88,
+    "sha_match": true,
+    "all_runs": [
+      {
+        "dur": 0.2431,
+        "mb_s": 411.33,
+        "ram_mb": 68.88
+      },
+      {
+        "dur": 0.2372,
+        "mb_s": 421.66,
+        "ram_mb": 65.02
+      },
+      {
+        "dur": 0.3354,
+        "mb_s": 298.15,
+        "ram_mb": 70.02
+      }
+    ]
+  },
+  "4 MB": {
+    "chunk_size_bytes": 4194304,
+    "requests_count": 25,
+    "median_duration_s": 0.2425,
+    "median_throughput_mb_s": 412.31,
+    "median_peak_ram_mb": 83.47,
+    "sha_match": true,
+    "all_runs": [
+      {
+        "dur": 0.2449,
+        "mb_s": 408.41,
+        "ram_mb": 80.49
+      },
+      {
+        "dur": 0.2425,
+        "mb_s": 412.31,
+        "ram_mb": 88.74
+      },
+      {
+        "dur": 0.2352,
+        "mb_s": 425.25,
+        "ram_mb": 83.47
+      }
+    ]
+  }
+}

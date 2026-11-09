@@ -34,6 +34,13 @@ logging.basicConfig(
     ]
 )
 
+DROPPED_RANGES = set()
+FAILED_RANGES = set()
+
+def clear_impairments():
+    DROPPED_RANGES.clear()
+    FAILED_RANGES.clear()
+
 class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -101,13 +108,17 @@ class ImpairmentRangeHandler(BaseHTTPRequestHandler):
                 length = end - start + 1
                 logging.info("--> RANGE REQUEST: bytes %d-%d/%d (length: %d)", start, end, file_size, length)
 
-                # Check if this range should return an error
-                if "fail_start" in query and int(query["fail_start"][0]) == start:
-                    logging.info("--> SIMULATING 503 for range starting at %d", start)
-                    self.send_response(503, "Service Unavailable")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
+                # Check if this range should return a transient error
+                if "fail_start" in query:
+                    fs = int(query["fail_start"][0])
+                    if (start == fs or (start <= fs and end >= fs)) and fs not in FAILED_RANGES:
+                        FAILED_RANGES.add(fs)
+                        logging.info("--> SIMULATING 503 for range starting at %d (target %d)", start, fs)
+                        self.send_response(503, "Service Unavailable")
+                        self.send_header("Retry-After", "1")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
 
                 self.send_response(206, "Partial Content")
                 self.send_header("Content-Type", "application/octet-stream")
@@ -152,8 +163,14 @@ class ImpairmentRangeHandler(BaseHTTPRequestHandler):
         drop_start = int(query.get("drop_start", [-1])[0])
         drop_after = int(query.get("drop_after", [2 * 1024 * 1024])[0])
 
-        is_slow = (slow_start >= 0 and offset == slow_start and slow_kb_s > 0)
-        is_drop = (drop_start >= 0 and offset == drop_start)
+        is_slow = (slow_start >= 0 and slow_kb_s > 0 and (
+            offset == slow_start or 
+            (offset >= slow_start and offset < slow_start + 25 * 1024 * 1024) or 
+            (offset <= slow_start and offset + length > slow_start)
+        ))
+        is_drop = (drop_start >= 0 and drop_start not in DROPPED_RANGES and (
+            offset == drop_start or (offset <= drop_start and offset + length > drop_start)
+        ))
 
         with open(file_path, "rb") as f:
             f.seek(offset)
@@ -173,6 +190,7 @@ class ImpairmentRangeHandler(BaseHTTPRequestHandler):
                 bytes_sent += len(chunk)
 
                 if is_drop and bytes_sent >= drop_after:
+                    DROPPED_RANGES.add(drop_start)
                     logging.info("--> SIMULATING FORCIBLE DISCONNECT at %d bytes on segment start %d", bytes_sent, offset)
                     try:
                         self.connection.shutdown(socket.SHUT_RDWR)

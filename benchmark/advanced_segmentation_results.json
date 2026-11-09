@@ -2,54 +2,56 @@
   "uniform": {
     "1": {
       "success": true,
-      "duration": 0.2122,
-      "mb_s": 471.31,
+      "duration": 0.8545,
+      "mb_s": 117.03,
       "sha_match": true
     },
     "4": {
       "success": true,
-      "duration": 0.1728,
-      "mb_s": 578.77,
+      "duration": 0.234,
+      "mb_s": 427.36,
       "sha_match": true
     },
     "8": {
       "success": true,
-      "duration": 0.1925,
-      "mb_s": 519.51,
+      "duration": 0.2252,
+      "mb_s": 444.03,
       "sha_match": true
     },
     "16": {
       "success": true,
-      "duration": 0.2392,
-      "mb_s": 418.06,
+      "duration": 0.2338,
+      "mb_s": 427.67,
       "sha_match": true
     },
     "32": {
       "success": true,
-      "duration": 0.3052,
-      "mb_s": 327.7,
+      "duration": 0.2319,
+      "mb_s": 431.16,
       "sha_match": true
     }
   },
   "slow_worker": {
     "success": true,
-    "duration": 6.8898,
-    "mb_s": 14.51,
+    "duration": 2.3353,
+    "mb_s": 42.82,
     "sha_match": true,
-    "analysis": "Static segmentation blocked by slowest worker"
+    "analysis": "Dynamic work stealing active"
   },
   "drop_worker": {
-    "return_code": 1,
-    "stdout": "",
-    "stderr": "BENCH_FAILED: error=Network chunk error: error decoding response body",
-    "duration": 0.0542,
-    "survived": false
+    "return_code": 0,
+    "stdout": "BENCH_RESULT: bytes=104857600 duration=0.3114 speed_mb_s=321.13",
+    "stderr": "",
+    "duration": 0.3259,
+    "survived": true,
+    "sha_match": true
   },
   "error_response": {
-    "return_code": 1,
-    "stdout": "",
-    "stderr": "BENCH_FAILED: error=Server returned HTTP 503 Service Unavailable",
-    "duration": 0.0774,
-    "survived": false
+    "return_code": 0,
+    "stdout": "BENCH_RESULT: bytes=104857600 duration=1.1097 speed_mb_s=90.12",
+    "stderr": "",
+    "duration": 1.1333,
+    "survived": true,
+    "sha_match": true
   }
 }

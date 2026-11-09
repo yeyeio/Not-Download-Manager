@@ -1,7 +1,7 @@
 {
   "case_a": {
     "success": true,
-    "duration": 0.1089,
+    "duration": 0.1488,
     "sha_match": true,
     "partinfo_cleaned": true
   },
@@ -38,9 +38,10 @@
     "behavior": "Gracefully ignored corrupted JSON, truncated garbage file, and completed clean download"
   },
   "case_f": {
-    "engine_validated_etag": false,
-    "resumed_blindly": true,
-    "vulnerability": "If remote content changes with same byte length, engine stitches old and new content without detecting ETag invalidation"
+    "engine_validated_etag": true,
+    "resumed_blindly": false,
+    "sha_match": true,
+    "behavior": "ETag mismatch detected; checkpoint safely invalidated and full download completed cleanly"
   },
   "case_g": {
     "survived": true,

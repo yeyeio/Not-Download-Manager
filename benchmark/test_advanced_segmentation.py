@@ -103,6 +103,7 @@ def run_test():
 
     # Test 3: One Worker Disconnected Mid-Download (TCP Reset)
     print("\n--- TEST 3: One Worker Disconnected Mid-Download ---")
+    advanced_server.clear_impairments()
     drop_url = f"{BASE_URL}/{target_file}?drop_start={slow_start}&drop_after=1048576"
     out_path = os.path.join(DOWNLOADS_DIR, "drop_worker_test.bin")
     if os.path.exists(out_path):
@@ -111,19 +112,23 @@ def run_test():
     t0 = time.perf_counter()
     proc = subprocess.run([RUST_BIN, drop_url, out_path, "4"], capture_output=True, text=True)
     dur = time.perf_counter() - t0
+    actual_size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    sha = calculate_sha256(out_path) if actual_size == expected_size else "MISMATCH"
 
     results["drop_worker"] = {
         "return_code": proc.returncode,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
         "duration": round(dur, 4),
-        "survived": proc.returncode == 0
+        "survived": proc.returncode == 0 and sha == expected_sha,
+        "sha_match": sha == expected_sha
     }
-    print(f"  Return code: {proc.returncode} | Survived: {proc.returncode == 0}")
+    print(f"  Return code: {proc.returncode} | Survived: {proc.returncode == 0} | SHA Match: {sha == expected_sha}")
     print(f"  Stderr output: {proc.stderr.strip()}")
 
     # Test 4: HTTP 503 / 429 Error on One Segment
     print("\n--- TEST 4: HTTP 503 / 429 on One Segment ---")
+    advanced_server.clear_impairments()
     err_url = f"{BASE_URL}/{target_file}?fail_start={slow_start}"
     out_path = os.path.join(DOWNLOADS_DIR, "err_worker_test.bin")
     if os.path.exists(out_path):
@@ -132,15 +137,18 @@ def run_test():
     t0 = time.perf_counter()
     proc = subprocess.run([RUST_BIN, err_url, out_path, "4"], capture_output=True, text=True)
     dur = time.perf_counter() - t0
+    actual_size = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    sha = calculate_sha256(out_path) if actual_size == expected_size else "MISMATCH"
 
     results["error_response"] = {
         "return_code": proc.returncode,
         "stdout": proc.stdout.strip(),
         "stderr": proc.stderr.strip(),
         "duration": round(dur, 4),
-        "survived": proc.returncode == 0
+        "survived": proc.returncode == 0 and sha == expected_sha,
+        "sha_match": sha == expected_sha
     }
-    print(f"  Return code: {proc.returncode} | Survived: {proc.returncode == 0}")
+    print(f"  Return code: {proc.returncode} | Survived: {proc.returncode == 0} | SHA Match: {sha == expected_sha}")
     print(f"  Stderr output: {proc.stderr.strip()}")
 
     # Save results

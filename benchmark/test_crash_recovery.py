@@ -165,23 +165,32 @@ def run_crash_tests():
         d.write(s.read(expected_size // 2))
         d.seek(expected_size - 1)
         d.write(b"\0")
-    # Checkpoint with ETag=v1
+    # Checkpoint with ETag=v1_original
     with open(part_f, "w") as f:
-        json.dump({"total_size": expected_size, "segments": segs}, f)
+        json.dump({
+            "version": 1,
+            "total_size": expected_size,
+            "etag": "v1_original",
+            "chunk_size": 2097152,
+            "committed_chunk_ids": list(range(25))
+        }, f)
 
     # Server now serves with etag=v2_modified
     url_v2 = f"{BASE_URL}/{target_file}?etag=v2_modified"
     proc_f = subprocess.run([RUST_BIN, url_v2, out_f, "8"], capture_output=True, text=True)
     sha_f = calculate_sha256(out_f)
 
-    # In engine.rs, probe HEAD ignores ETag, so it blindly resumed using old slices!
+    # In Phase 3, SegmentManager detects etag mismatch and invalidates the checkpoint,
+    # cleanly restarting from byte 0 rather than blindly resuming mismatched content!
+    etag_validated = sha_f == expected_sha and not os.path.exists(part_f)
     results["case_f"] = {
-        "engine_validated_etag": False,
-        "resumed_blindly": True,
-        "vulnerability": "If remote content changes with same byte length, engine stitches old and new content without detecting ETag invalidation"
+        "engine_validated_etag": etag_validated,
+        "resumed_blindly": not etag_validated,
+        "sha_match": sha_f == expected_sha,
+        "behavior": "ETag mismatch detected; checkpoint safely invalidated and full download completed cleanly" if etag_validated else "Blindly resumed mismatched ETag"
     }
     print(f"  ETag validated by engine: {results['case_f']['engine_validated_etag']}")
-    print(f"  Vulnerability: {results['case_f']['vulnerability']}")
+    print(f"  Behavior: {results['case_f']['behavior']}")
 
     # --- CASE G: Delete Temporary File While Retaining Metadata ---
     print("\n--- CASE G: Delete Temporary File While Retaining Metadata ---")
