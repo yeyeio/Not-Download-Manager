@@ -6,3 +6,10 @@ benchmark/*.bin
 benchmark/downloads/
 benchmark/downloads_idm/
 screenshot*.png
+
+*.bin
+*.log
+benchmark/*.bin
+benchmark/downloads/
+benchmark/downloads_idm/
+screenshot*.png

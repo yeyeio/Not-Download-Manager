@@ -1,0 +1,39 @@
+{
+  "http_200_rejection": {
+    "exit_code": 1,
+    "failed_safely": true,
+    "stderr": "BENCH_FAILED: error=Server returned HTTP 200 OK instead of 206 Partial Content",
+    "verdict": "PASS"
+  },
+  "missing_content_range": {
+    "exit_code": 1,
+    "failed_safely": true,
+    "stderr": "BENCH_FAILED: error=Missing Content-Range header in HTTP 206 response",
+    "verdict": "PASS"
+  },
+  "mismatched_content_range": {
+    "exit_code": 1,
+    "failed_safely": true,
+    "stderr": "BENCH_FAILED: error=Content-Range mismatch: expected bytes 0-2097151, server returned 5000000-7000000",
+    "verdict": "PASS"
+  },
+  "http_429_backoff": {
+    "exit_code": 0,
+    "duration": 1.1531,
+    "sha_match": true,
+    "retries_handled": true,
+    "verdict": "PASS"
+  },
+  "multiple_slow_workers": {
+    "exit_code": 0,
+    "duration": 0.4504,
+    "sha_match": true,
+    "verdict": "PASS"
+  },
+  "crash_consistency": {
+    "kill_survived": true,
+    "final_sha_match": true,
+    "no_orphan_tmp": true,
+    "verdict": "PASS"
+  }
+}
