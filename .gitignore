@@ -1,0 +1,8 @@
+/target
+/shots
+*.bin
+*.log
+benchmark/*.bin
+benchmark/downloads/
+benchmark/downloads_idm/
+screenshot*.png

@@ -1,0 +1,164 @@
+{
+  "100 MB": {
+    "file_size_bytes": 104857600,
+    "repetitions": 5,
+    "median_throughput_mb_s": 431.75,
+    "min_throughput_mb_s": 336.58,
+    "max_throughput_mb_s": 497.54,
+    "median_duration_s": 0.2316,
+    "min_duration_s": 0.201,
+    "max_duration_s": 0.2971,
+    "median_peak_ram_mb": 87.75,
+    "all_sha_matches": true,
+    "runs": [
+      {
+        "rep": 1,
+        "duration_s": 0.2971,
+        "throughput_mb_s": 336.58,
+        "peak_ram_mb": 87.75,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 2,
+        "duration_s": 0.2504,
+        "throughput_mb_s": 399.31,
+        "peak_ram_mb": 78.75,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 3,
+        "duration_s": 0.2316,
+        "throughput_mb_s": 431.75,
+        "peak_ram_mb": 85.27,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 4,
+        "duration_s": 0.2204,
+        "throughput_mb_s": 453.8,
+        "peak_ram_mb": 95.33,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 5,
+        "duration_s": 0.201,
+        "throughput_mb_s": 497.54,
+        "peak_ram_mb": 97.18,
+        "ranges_logged": 8,
+        "sha_match": true
+      }
+    ]
+  },
+  "1 GB": {
+    "file_size_bytes": 1073741824,
+    "repetitions": 5,
+    "median_throughput_mb_s": 421.32,
+    "min_throughput_mb_s": 276.6,
+    "max_throughput_mb_s": 450.68,
+    "median_duration_s": 2.4304,
+    "min_duration_s": 2.2721,
+    "max_duration_s": 3.702,
+    "median_peak_ram_mb": 123.55,
+    "all_sha_matches": true,
+    "runs": [
+      {
+        "rep": 1,
+        "duration_s": 2.4304,
+        "throughput_mb_s": 421.32,
+        "peak_ram_mb": 125.65,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 2,
+        "duration_s": 3.702,
+        "throughput_mb_s": 276.6,
+        "peak_ram_mb": 123.88,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 3,
+        "duration_s": 2.6443,
+        "throughput_mb_s": 387.25,
+        "peak_ram_mb": 122.85,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 4,
+        "duration_s": 2.3128,
+        "throughput_mb_s": 442.75,
+        "peak_ram_mb": 123.5,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 5,
+        "duration_s": 2.2721,
+        "throughput_mb_s": 450.68,
+        "peak_ram_mb": 123.55,
+        "ranges_logged": 8,
+        "sha_match": true
+      }
+    ]
+  },
+  "5 GB": {
+    "file_size_bytes": 5368709120,
+    "repetitions": 5,
+    "median_throughput_mb_s": 311.5,
+    "min_throughput_mb_s": 245.33,
+    "max_throughput_mb_s": 359.02,
+    "median_duration_s": 16.4364,
+    "min_duration_s": 14.2612,
+    "max_duration_s": 20.87,
+    "median_peak_ram_mb": 128.32,
+    "all_sha_matches": true,
+    "runs": [
+      {
+        "rep": 1,
+        "duration_s": 20.87,
+        "throughput_mb_s": 245.33,
+        "peak_ram_mb": 125.59,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 2,
+        "duration_s": 20.7491,
+        "throughput_mb_s": 246.76,
+        "peak_ram_mb": 127.13,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 3,
+        "duration_s": 16.4364,
+        "throughput_mb_s": 311.5,
+        "peak_ram_mb": 132.57,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 4,
+        "duration_s": 15.1779,
+        "throughput_mb_s": 337.33,
+        "peak_ram_mb": 128.32,
+        "ranges_logged": 8,
+        "sha_match": true
+      },
+      {
+        "rep": 5,
+        "duration_s": 14.2612,
+        "throughput_mb_s": 359.02,
+        "peak_ram_mb": 130.9,
+        "ranges_logged": 8,
+        "sha_match": true
+      }
+    ]
+  }
+}

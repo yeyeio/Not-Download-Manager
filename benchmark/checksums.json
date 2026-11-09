@@ -1,0 +1,14 @@
+{
+  "bench_100mb.bin": {
+    "size": 104857600,
+    "sha256": "47d379b19e48cdbff5a4e374be33f07c004762a3e388d11e898ff85ac9c7c5da"
+  },
+  "bench_1gb.bin": {
+    "size": 1073741824,
+    "sha256": "84735696618f4d819027ac1cd0c3d60aa4fbe1ea02314bd09a1ffb37476b9d69"
+  },
+  "bench_5gb.bin": {
+    "size": 5368709120,
+    "sha256": "44eae47d967828defa229726e12e9d723233f29f5be11f19047435e09ed3d99a"
+  }
+}
