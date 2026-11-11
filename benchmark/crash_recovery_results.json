@@ -1,0 +1,52 @@
+{
+  "case_a": {
+    "success": true,
+    "duration": 0.1488,
+    "sha_match": true,
+    "partinfo_cleaned": true
+  },
+  "case_b": {
+    "25%": {
+      "partinfo_existed_after_kill": false,
+      "resumed_or_restarted": "restarted_from_zero",
+      "final_sha_match": true,
+      "corrupted_marked_completed": false
+    },
+    "50%": {
+      "partinfo_existed_after_kill": false,
+      "resumed_or_restarted": "restarted_from_zero",
+      "final_sha_match": true,
+      "corrupted_marked_completed": false
+    },
+    "75%": {
+      "partinfo_existed_after_kill": false,
+      "resumed_or_restarted": "restarted_from_zero",
+      "final_sha_match": true,
+      "corrupted_marked_completed": false
+    }
+  },
+  "case_c_d": {
+    "sqlite_or_json_db": false,
+    "mechanism": "Hardcoded populate_sample_downloads() in ui.rs; tasks kept in memory Vec<DownloadItem> only",
+    "state_restored_on_restart": false,
+    "conclusion": "GUI download history is lost across restarts unless user re-enters URL"
+  },
+  "case_e": {
+    "survived": true,
+    "final_sha_match": true,
+    "corrupted_marked_completed": false,
+    "behavior": "Gracefully ignored corrupted JSON, truncated garbage file, and completed clean download"
+  },
+  "case_f": {
+    "engine_validated_etag": true,
+    "resumed_blindly": false,
+    "sha_match": true,
+    "behavior": "ETag mismatch detected; checkpoint safely invalidated and full download completed cleanly"
+  },
+  "case_g": {
+    "survived": true,
+    "final_sha_match": true,
+    "corrupted_marked_completed": false,
+    "behavior": "Detected missing save_path, bypassed resume, initiated clean download from byte 0"
+  }
+}

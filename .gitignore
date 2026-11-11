@@ -1,0 +1,14 @@
+/target
+/shots
+/docs
+.agents/
+.gemini/
+graphify-out/
+__pycache__/
+*.bin
+*.log
+*.png
+*.zip
+benchmark/*.bin
+benchmark/downloads/
+benchmark/downloads_idm/

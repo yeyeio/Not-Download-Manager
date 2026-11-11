@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "values": [
+    {
+      "name": "default_max_connections",
+      "group": "connection",
+      "value": 8,
+      "unit": "connections",
+      "source": "function 0x4fee00"
+    },
+    {
+      "name": "speed_limiter_multiplier",
+      "group": "transfer",
+      "value": 1024,
+      "unit": "bytes/sec",
+      "source": "function 0x536ba4"
+    },
+    {
+      "name": "range_header_format",
+      "group": "protocol",
+      "value": "Range: bytes=%I64d-%I64d\\r\\n",
+      "source": "function 0x589a3e"
+    },
+    {
+      "name": "tail_range_header_format",
+      "group": "protocol",
+      "value": "Range: bytes=%I64d-\\r\\n",
+      "source": "function 0x589adb"
+    },
+    {
+      "name": "speed_limiter_key",
+      "group": "configuration",
+      "value": "bUseSpeedLimiter",
+      "source": "function 0x5b8058"
+    },
+    {
+      "name": "default_file_types",
+      "group": "filters",
+      "value": "3GP 7Z AAC ACE AIF APK ARJ ASF AVI BIN BZ2 EXE GZ GZIP IMG ISO LZH M4A M4V MKV MOV MP3 MP4 MPA MPE MPEG MPG MSI MSU OGG OGV PDF PLJ PPS PPT QT R0* R1* RA RAR RM RMVB SEA SIT SITX TAR TIF TIFF WAV WMA WMV Z ZIP",
+      "source": "function 0x44ca5d"
+    },
+    {
+      "name": "network_buffer_size",
+      "group": "transfer",
+      "value": 65536,
+      "unit": "bytes",
+      "estimated": true
+    },
+    {
+      "name": "min_segment_size",
+      "group": "transfer",
+      "value": 524288,
+      "unit": "bytes",
+      "estimated": true
+    },
+    {
+      "name": "retry_attempts",
+      "group": "transfer",
+      "value": 10,
+      "unit": "times",
+      "estimated": true
+    },
+    {
+      "name": "retry_delay_seconds",
+      "group": "transfer",
+      "value": 5,
+      "unit": "seconds",
+      "estimated": true
+    }
+  ]
+}

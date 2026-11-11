@@ -1,0 +1,113 @@
+{
+  "meta": {
+    "size": 104857600,
+    "sha256": "47d379b19e48cdbff5a4e374be33f07c004762a3e388d11e898ff85ac9c7c5da"
+  },
+  "rust_engine": {
+    "1": {
+      "median_duration_s": 0.1294,
+      "median_throughput_mb_s": 772.94,
+      "min_throughput_mb_s": 159.19,
+      "max_throughput_mb_s": 787.0,
+      "active_range_connections_median": 0,
+      "full_get_requests_median": 1,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "4": {
+      "median_duration_s": 0.1799,
+      "median_throughput_mb_s": 555.86,
+      "min_throughput_mb_s": 536.93,
+      "max_throughput_mb_s": 694.16,
+      "active_range_connections_median": 4,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "8": {
+      "median_duration_s": 0.2006,
+      "median_throughput_mb_s": 498.39,
+      "min_throughput_mb_s": 480.83,
+      "max_throughput_mb_s": 582.4,
+      "active_range_connections_median": 8,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "16": {
+      "median_duration_s": 0.1999,
+      "median_throughput_mb_s": 500.37,
+      "min_throughput_mb_s": 372.53,
+      "max_throughput_mb_s": 567.2,
+      "active_range_connections_median": 16,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "32": {
+      "median_duration_s": 0.2416,
+      "median_throughput_mb_s": 413.9,
+      "min_throughput_mb_s": 199.93,
+      "max_throughput_mb_s": 518.74,
+      "active_range_connections_median": 32,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    }
+  },
+  "reference_multi_range": {
+    "1": {
+      "median_duration_s": 0.5304,
+      "median_throughput_mb_s": 188.54,
+      "min_throughput_mb_s": 180.47,
+      "max_throughput_mb_s": 210.66,
+      "active_range_connections_median": 1,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "4": {
+      "median_duration_s": 0.3263,
+      "median_throughput_mb_s": 306.46,
+      "min_throughput_mb_s": 287.79,
+      "max_throughput_mb_s": 359.2,
+      "active_range_connections_median": 4,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "8": {
+      "median_duration_s": 0.3175,
+      "median_throughput_mb_s": 314.99,
+      "min_throughput_mb_s": 305.89,
+      "max_throughput_mb_s": 345.82,
+      "active_range_connections_median": 8,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "16": {
+      "median_duration_s": 0.7013,
+      "median_throughput_mb_s": 142.59,
+      "min_throughput_mb_s": 137.08,
+      "max_throughput_mb_s": 149.03,
+      "active_range_connections_median": 16,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    },
+    "32": {
+      "median_duration_s": 1.1975,
+      "median_throughput_mb_s": 83.51,
+      "min_throughput_mb_s": 83.27,
+      "max_throughput_mb_s": 137.58,
+      "active_range_connections_median": 32,
+      "full_get_requests_median": 0,
+      "sha256_match": true,
+      "reps": 5
+    }
+  },
+  "idm": {
+    "status": "FAILED or GUI prompted"
+  }
+}
